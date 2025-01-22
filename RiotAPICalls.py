@@ -75,6 +75,6 @@ def testAPIs(playerName,region):
     print("This persons rank is:")
     print(myRank)
 
-myInput = input("Enter a summoner name to test! This should be in the format Summoner name#NA1 or summonername#XYZ")
+myInput = input("Enter a summoner name to test! This should be in the format Summoner name#NA1 or summonername#XYZ ")
 nameAndRegion = myInput.split("#")
 testAPIs(nameAndRegion[0],nameAndRegion[1])
