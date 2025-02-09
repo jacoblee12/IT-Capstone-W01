@@ -51,22 +51,14 @@ GSHEETS_ID = os.getenv('GSHEETS_ID')
 GHSEETS_GAMEDB = os.getenv('GHSEETS_GAMEDB')
 GSHEETS_PLAYERDB = os.getenv('GSHEETS_PLAYERDB')
 GSHEETS_TOURNAMENTDB = os.getenv('GSHEETS_TOURNAMENTDB')
-
-# Paths for spreadsheet and SQLite database on the bot host's device
-SPREADSHEET_PATH = os.path.abspath(os.getenv('SPREADSHEET_PATH'))
-DB_PATH = os.getenv('DB_PATH')
-
 WELCOME_CHANNEL_ID = os.getenv('WELCOME_CHANNEL_ID')
-
 TIER_WEIGHT = float(os.getenv('TIER_WEIGHT', 0.7))  # Default value of 0.7 if not specified in .env
 ROLE_PREFERENCE_WEIGHT = float(os.getenv('ROLE_PREFERENCE_WEIGHT', 0.3))  # Default value of 0.3 if not specified in .env
 TIER_GROUPS = os.getenv('TIER_GROUPS', 'UNRANKED,IRON,BRONZE,SILVER:GOLD,PLATINUM:EMERALD:DIAMOND:MASTER:GRANDMASTER:CHALLENGER') # Setting default tier configuration if left blank in .env
 CHECKIN_TIME = os.getenv('CHECKIN_TIME')
 CHECKIN_TIME = int(CHECKIN_TIME)
 
-ROLE_ORDER = ["top", "jungle", "mid", "adc(bot)", "support"]
-
-# # Adjust event loop policy for Windows
+# Adjust event loop policy for Windows
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
@@ -74,44 +66,6 @@ if platform.system() == "Windows":
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent requests to 5
 
 session = None
-
-"""
-
-# This is for Google Sheets OAuth2 code
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-SAMPLE_SPREADSHEET_ID = GSHEETS_ID
-SAMPLE_RANGE_NAME = "TournamentDatabase!A2:E"
-creds = None
-if os.path.exists("token.json"):
-    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-
-if not creds or not creds.valid:
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-    else:
-        flow = InstalledAppFlow.from_client_secrets_file(
-            "credentials.json", SCOPES
-    )
-    creds = flow.run_local_server(port=0)
-# Save the credentials for the next run
-with open("token.json", "w") as token:
-    token.write(creds.to_json())
-
-service = build("sheets", "v4", credentials=creds)
-sheet = service.spreadsheets()
-result = (
-    sheet.values()
-    .get(spreadsheetId=SAMPLE_SPREADSHEET_ID, range=SAMPLE_RANGE_NAME)
-    .execute()
-)
-values = result.get("values", [])
-
-print("Name, Major:")
-for row in values:
-    # Print columns A and E, which correspond to indices 0 and 4.
-    print(row)
-
-"""
 
 # Set up gspread for access by functions
 
@@ -122,315 +76,27 @@ tourneyDB = googleWorkbook.worksheet('TournamentDatabase')
 gameDB = googleWorkbook.worksheet('GameDatabase')
 playerDB = googleWorkbook.worksheet('PlayerDatabase')
 
+# Set up API call to get data from the database
 
-# MM Testing----------------------------------------------------------------------
-
-kidusSheet = gc.open_by_key('1PTSCaGA8kza90SWagWrnrvAhlb5EJyh04k5jQFvVam4').worksheet('Test2')
-
-ROLE_ORDER = ["Top", "Jungle", "Mid", "ADC", "Support"]
-
-RANK_VALUES = {
-    "Challenger": 10, "Grandmaster": 9, "Master": 8,
-    "Diamond": 7, "emerald": 6, "Platinum": 5, "Gold": 4,  #Kidus has the emerald in lowercase in the google sheets so ensure it is lowercase in integration or update to make them all case insensitive
-    "Silver": 3, "Bronze": 2, "Iron": 1, "Unranked": 0
-}
-
-RANK_GROUPS = [
-    {10, 9, 8},# Challenger, Grandmaster, Master
-    {8},         #Master
-    {7},         # Diamond
-    {6, 5},      # Emerald, Platinum
-    {5, 4},      # Platinum, Gold
-    {3, 2, 1}    # Silver, Bronze, Iron
-]
-
-def get_players_sheet():
-    """Fetch player data from Google Sheets."""
-    data = kidusSheet.get_all_records()
-    players = []
-
-    for row in data:
-        rank = row.get("Rank Tier", "Unranked").strip()
-        last_rank = row.get("Last Season Rank", "Unranked").strip()
-        rank_value = RANK_VALUES.get(rank, RANK_VALUES.get(last_rank, 0))
-
-        roles = [role for role in ROLE_ORDER if row.get(f"Role {ROLE_ORDER.index(role) + 1} ({role})", "").strip().lower() == "yes"]
-        if not roles:
-            roles.append(random.choice(ROLE_ORDER))
-
-        players.append({
-            "name": row.get("Player Name", "").strip(),
-            "rank": rank,
-            "rank_value": rank_value,
-            "roles": roles,
-        })
-    return players
-
-
-def assign_roles(players):
-    """Distribute players into roles, ensuring balance and no duplicate players."""
-    assigned_roles = {role: [] for role in ROLE_ORDER}
-    random.shuffle(players)
-
-    for player in players:
-        for role in player["roles"]:
-            if len(assigned_roles[role]) < 2:
-                assigned_roles[role].append(player)
-                break
-    return assigned_roles
-
-
-def valid_team_match(team1, team2):
-    """Check if teams meet rank restrictions with fallback logic."""
-    team1_ranks = {p["rank_value"] for p in team1}
-    team2_ranks = {p["rank_value"] for p in team2}
-    combined_ranks = team1_ranks | team2_ranks  # Merge both teams' ranks into one set(used for fallback ranks(i.e not enough emerald players so plat can play))
-
-    # Bronze, Silver, and Iron can always match together
-    if combined_ranks.issubset({3, 2, 1}):
-        return True  
-
-    #  Challenger (10) & Grandmaster (9) can play together
-    if combined_ranks.issubset({10, 9}):
-        return True  
-
-    #  If there aren’t enough, they can play with Masters (8) ONLY
-    if combined_ranks.issubset({10, 9, 8}):
-        return True  
-
-    #  High tiers (10, 9, 8) should NEVER match with 7 (Diamond) or below
-    if any(r in combined_ranks for r in {10, 9, 8}) and any(r in combined_ranks for r in {7, 6, 5, 4, 3, 2, 1}):
-        return False  
-
-    #  Platinum (5) can play with Emerald (6) if Gold (4) is NOT present
-    if 5 in combined_ranks and 6 in combined_ranks and 4 not in combined_ranks:
-        return True  
-
-    #  Platinum (5) can play with Gold (4) if Emerald (6) is NOT present
-    if 5 in combined_ranks and 4 in combined_ranks and 6 not in combined_ranks:
-        return True  
-
-    #  Prevent Gold (4) and Emerald (6) from playing together
-    if 4 in combined_ranks and 6 in combined_ranks:
-        return False  
-
-    # If both teams are within the same defined rank group, allow match
-    for group in RANK_GROUPS:
-        if team1_ranks.issubset(group) and team2_ranks.issubset(group):
-            return True  
-
-    return False  
-
-
-
-def find_player_for_role(unassigned, role, rank_group, fallback_group=None):
-    """Find a player for a role within a specific rank group, falling back only to the highest adjacent rank."""
-    for player in unassigned:
-        if player["rank_value"] in rank_group:
-            player["role"] = role
-            unassigned.remove(player)
-            return player
-    if fallback_group:
-        for player in unassigned:
-            if player["rank_value"] in fallback_group:
-                player["role"] = role
-                unassigned.remove(player)
-                return player
-    return None
-
-
-def balance_rank_distribution(team1, team2):
-    """Ensure higher-ranked players are evenly distributed across teams, 
-       but allow a max difference of 1 for any rank group."""
-    
-    # Group players by rank
-    team1_ranks = {p["rank_value"]: [] for p in team1}
-    team2_ranks = {p["rank_value"]: [] for p in team2}
-
-    for p in team1:
-        team1_ranks[p["rank_value"]].append(p)
-    for p in team2:
-        team2_ranks[p["rank_value"]].append(p)
-
-    # Identify unbalanced ranks
-    for rank in set(team1_ranks.keys()) | set(team2_ranks.keys()):  
-        count1 = len(team1_ranks.get(rank, []))
-        count2 = len(team2_ranks.get(rank, []))
-
-        # Allows a difference of 1 (e.g., 2 vs. 3 Emeralds is fine)
-        if abs(count1 - count2) <= 1:
-            continue  
-
-        # swap players only if the difference is greater than 1(i.e 4 emerald 1 plat vs 1 emerald 4 plat )
-        while abs(count1 - count2) > 1:
-            if count1 > count2:
-                # Move a player from team1 → team2
-                swap_player = team1_ranks[rank].pop(0)  
-                team1.remove(swap_player)
-                team2.append(swap_player)
-                team2_ranks[rank].append(swap_player)
-            else:
-                # Move a player from team2 → team1
-                swap_player = team2_ranks[rank].pop(0)  
-                team2.remove(swap_player)
-                team1.append(swap_player)
-                team1_ranks[rank].append(swap_player)
-
-            # Update counts after swap
-            count1 = len(team1_ranks.get(rank, []))
-            count2 = len(team2_ranks.get(rank, []))
-
-def fill_remaining_spots(team, other_team, unassigned):
-    """Ensure each team has 5 players, prioritizing role preferences, while validating rank compatibility."""
-    assigned_roles = {p["role"] for p in team}  # Tracks which roles are already filled
-    
-    while len(team) < 5 and unassigned:
-        for player in unassigned:
-            preferred_role = next((role for role in player["roles"] if role not in assigned_roles), None)
-            if preferred_role and valid_team_match(team + [player], other_team):  
-                player["role"] = preferred_role
-                team.append(player)
-                unassigned.remove(player)
-                assigned_roles.add(preferred_role)
-                break  
-        if len(team) < 5:
-            for player in unassigned:
-                temp_team = team + [player]
-                if valid_team_match(temp_team, other_team):  
-                    available_roles = [role for role in ROLE_ORDER if role not in assigned_roles]
-                    player["role"] = available_roles[0] if available_roles else "Fill"  # Assign any available role when there isn't anymore valid rank matchups regardless of preference(we could add this part for the volunteer queue)
-                    team.append(player)
-                    unassigned.remove(player)
-                    assigned_roles.add(player["role"])
-                    break  # Exit loop when roles are filled
-
-
-def create_balanced_teams(attempts=0):
-    """Create balanced teams ensuring rank restrictions, role assignment, and reshuffling if necessary."""
-    players = get_players_sheet()
-    if len(players) < 10:
-        return "Error: Not enough players."
-
-    assigned_roles = {role: [] for role in ROLE_ORDER}
-    random.shuffle(players)
-
-    for player in players:
-        for role in player["roles"]:
-            if len(assigned_roles[role]) < 2:
-                assigned_roles[role].append(player)
-                break
-
-    team1, team2, used_players = [], [], set()
-    team1_rank_group, team2_rank_group = set(), set()
-
-    # Assign first player, who sets the rank group so players in wrong rank won't match
-    for role in ROLE_ORDER:
-        if len(assigned_roles[role]) == 2:
-            p1, p2 = assigned_roles[role]
-
-            team1_rank_group = {p1["rank_value"], p1["rank_value"] + 1}
-            team2_rank_group = {p2["rank_value"], p2["rank_value"] + 1}
-
-            team1.append({"name": p1["name"], "rank": p1["rank"], "rank_value": p1["rank_value"], "role": role})
-            team2.append({"name": p2["name"], "rank": p2["rank"], "rank_value": p2["rank_value"], "role": role})
-            used_players.update([p1["name"], p2["name"]])
-            break
-
-    unassigned = [p for p in players if p["name"] not in used_players]
-
-    for team, rank_group in zip([team1, team2], [team1_rank_group, team2_rank_group]):
-        for role in ROLE_ORDER:
-            if not any(p["role"] == role for p in team):
-                player = find_player_for_role(unassigned, role, rank_group)
-                if player:
-                    temp_team = team + [player]
-                    if valid_team_match(team1, team2):
-                        team.append(player)
-                        used_players.add(player["name"])
-                    else:
-                        print(f"⚠ Skipping {player['name']} for {role} due to rank mismatch.")
-
-    """This part of the code is to ensure 5 players and that if higher tiers are in a game it is equal amount on both teams(within 1 since it's 5v5)"""
-    fill_remaining_spots(team1, team2, unassigned)
-    fill_remaining_spots(team2, team1, unassigned)
-    balance_rank_distribution(team1, team2)
-
-    print("\n--- Final Team Check ---")
-    for i, team in enumerate([team1, team2], 1):
-        print(f"\nTeam {i}:")
-        for player in team:
-            print(f"{player['name']} - Rank: {player['rank']} (Value: {player['rank_value']}) - Role: {player['role']}")
-
-    #Final validation
-    if not valid_team_match(team1, team2):
-        return "Error: Teams do not meet rank restrictions."
-
-    return team1, team2
-
-finalTest = create_balanced_teams()
-
-# MM Testing---------------------------------------------------------------
-
-# API Calls to get the current database informations. Running this now should cut down on the total number of required calls. 
-
-tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
-gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API)) 
 playerAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
+gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
+tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
-def refreshData():
-    tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
-    gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API)) 
+def refreshPlayerData():
+    
+    playerDB = googleWorkbook.worksheet('PlayerDatabase')
     playerAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
-def rank_to_value(rank):
-    rank_order = {
-        "IRON": 1, "BRONZE": 2, "SILVER": 3, "GOLD": 4,
-        "PLATINUM": 5, "DIAMOND": 6, "Emerald": 7, "MASTER": 8,
-        "GRANDMASTER": 9, "CHALLENGER": 10
-    }
+def refreshGameData():
 
-    parts = rank.upper().split()
-    base_rank = parts[0]
-    tier = parts[1] if len(parts) > 1 else None
+    gameDB = googleWorkbook.worksheet('GameDatabase')
+    gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
-    base_value = rank_order.get(base_rank, 1)
+def refreshTourneyData():
 
-    if base_rank in ["MASTER", "GRANDMASTER", "CHALLENGER"]:
-        return base_value * 10
+    tourneyDB = googleWorkbook.worksheet('TournamentDatabase')
+    tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
-    tier_values = {"I": 1, "II": 2, "III": 3, "IV": 4}
-    tier_value = tier_values.get(tier, 4)
-
-    return base_value * 10 + (5 - tier_value)
-
-def can_match(team1, team2):
-    if len(team1) != 5 or len(team2) != 5:
-        return False, "Invalid teams: Each team must have exactly 5 players."
-    
-    team1_values = [rank_to_value(player.tier) for player in team1]
-    team2_values = [rank_to_value(player.tier) for player in team2]
-    
-    if None in team1_values or None in team2_values:
-        return "UNRANKED", "Admin must manually assign a rank before matching."
-    
-    base_ranks1 = [value // 10 for value in team1_values]
-    base_ranks2 = [value // 10 for value in team2_values]
-    
-    # Enforce restrictions
-    if any(br == 10 for br in base_ranks1) and any(br == 9 for br in base_ranks2):
-        return True
-    if any(br in [10, 9] for br in base_ranks1) and any(br == 8 for br in base_ranks2):
-        return True
-    if all(abs(br1 - br2) <= 1 and br1 >= 6 for br1, br2 in zip(base_ranks1, base_ranks2)):
-        return True
-    if all(br <= 3 for br in base_ranks1 + base_ranks2):
-        return True
-    if all(br in [4, 5] for br in base_ranks1 + base_ranks2):
-        return True
-    if all(br1 == br2 for br1, br2 in zip(base_ranks1, base_ranks2)):
-        return True
-    
-    return False,
 
 # On bot ready event
 @client.event
@@ -1027,14 +693,6 @@ class RolePreferenceDropdown(discord.ui.Select):
         # Concatenate the role preferences into a single string
         role_pref_string = ''.join(str(self.parent_view.values[role]) for role in ["Top", "Jungle", "Mid", "Bot", "Support"])
 
-        # Update the database with the new role preferences
-        async with aiosqlite.connect(DB_PATH) as conn:
-            await conn.execute(
-                "UPDATE PlayerStats SET RolePreference = ? WHERE DiscordID = ?",
-                (role_pref_string, str(self.parent_view.member_id))
-            )
-            await conn.commit()
-
         # Acknowledge interaction
         await interaction.response.defer()  # Acknowledge the interaction without updating the message
 
@@ -1054,33 +712,6 @@ async def rolepreference(interaction: discord.Interaction):
     if not any(role.name in ["Player", "Volunteer"] for role in member.roles):
         await interaction.response.send_message("You must have the Player or Volunteer role to set role preferences.", ephemeral=True)
         return
-
-    # Check if the user is in the database and retrieve their current preferences
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute("SELECT RolePreference FROM PlayerStats WHERE DiscordID = ?", (str(member.id),)) as cursor:
-            user_data = await cursor.fetchone()
-
-        if not user_data:
-            await interaction.response.send_message("You need to link your Riot ID using /link before setting role preferences.", ephemeral=True)
-            return
-
-    # Convert the existing role preferences into a dictionary
-    role_pref_string = user_data[0]
-    initial_values = {
-        "Top": int(role_pref_string[0]),
-        "Jungle": int(role_pref_string[1]),
-        "Mid": int(role_pref_string[2]),
-        "Bot": int(role_pref_string[3]),
-        "Support": int(role_pref_string[4])
-    }
-
-    # Create the view with initial values and send initial response
-    view = RolePreferenceView(member.id, initial_values)
-    await interaction.response.send_message(
-        "Please select your roles in order of preference, with 1 being the most preferred:", 
-        view=view,
-        ephemeral=True
-    )
 
 
 
@@ -1124,24 +755,29 @@ class Team:
         return self.skill_sum / len(self.players) if self.players else 0  
 
 class lobby:
-    def __init__(self,tourneyID):
+    def __init__(self):
 
-        self.tourneyID = tourneyID
         team1 = []
         team2 = [] 
 
-        previousGameID = gameAPIRequest.json()['values'][0][-1]
+        currentTourneyID = tourneyDB.col_values(1)[-1]
+        previousGameID = gameDB.col_values(1)[-1]
+        currentGameID = ""
 
         if previousGameID.isnumeric() == True:
 
-            self.gameID = int(previousGameID) + 1
+            currentGameID = int(previousGameID) + 1
         else:
 
-            self.gameID = 1
+            currentGameID = 1
 
         # Game is created, so write to database. Will need for buttons to work later.
-        gameDB.update_acell('A' + str(self.gameID + 1) , str(self.gameID))
-        gameDB.update_acell('B' + str(self.gameID + 1) , str(self.tourneyID))
+
+        gameDB.update_acell('A' + str(currentGameID + 1) , str(currentGameID))
+        gameDB.update_acell('B' + str(currentGameID + 1) , str(currentTourneyID))
+
+        # This part just creates random teams, no real matchmaking yet.
+        # TODO - add working matchmaking
 
         players = playerAPIRequest.json()['values'][0]
         players.pop(0)
@@ -1160,56 +796,46 @@ class lobby:
 
         for x in range(len(team2)):
             print("")
-            print(str(team2[x]) + " is player " + str(x + 1) + " for team 2.")
+            print(str(team2[x]) + " is player " + str(x + 1) + " for team 2.")   
+            
+        # Write players to database
 
+        gameDB.update_acell('E' + str(currentGameID + 1) + 'N' + str(currentGameID + 1), str(currentGameID))
 
-
-    # Wait here for game to finish, somehow
-
-    # What if we have a "create game" button, that will fire when the person wants it to go.
-    # It can create a number of games based on volunteer size.
-    # Write everything to database, then pull from database to get most up to date info.
-    # Database is be-all-end-all authority. 
-    # For example, when checkin is run, create database entry for the tournament ID. 
-    # Then, when a game is created, the create game buttons will be tied to the latest entry as the tourney ID.
-    # Then, when a game is finished, run the winner command with game number as input?
-    # MVP command the same way
-    # That way, create as many games as you want?
-
+        gameDB.batch_update([{
+    'range': 'E' + str(currentGameID + 1) + ':N' + str(currentGameID + 1),
+    'values': [[str(team1[0]), str(team1[1]),str(team1[2]),str(team1[3]),str(team1[4]),str(team2[0]),str(team2[1]),str(team2[2]),str(team2[3]),str(team2[4])]],
+}])
+ 
+def declareWinner(self,team,gameNumber):
         
-        
+    return team
 
-    def declareWinner(self,team):
-        
-        return team
+def declareMVP(self,gameNumber):
 
-    def declareMVP(self,winner):
+    MVP = "winner"
+    return MVP
+            
 
-        MVP = winner
-        return MVP
-        # End lobby
-
-    
 class Tournament:
 
     def __init__(self):
-
-        self.gameList = [] 
         
-        previousTourneyID = tourneyAPIRequest.json()['values'][0][-1]
+        previousTourneyID = tourneyDB.col_values(1)[-1]
+        currentTourneyID = ""
 
         if previousTourneyID.isnumeric() == True:
 
-            self.tourneyID = int(previousTourneyID) + 1
+            currentTourneyID = int(previousTourneyID) + 1
 
         else:
 
-            self.tourneyID = 1
+            currentTourneyID = 1
         
         # Write to tournament database
         DBFormula = tourneyDB.get("B2" , value_render_option=ValueRenderOption.formula)
-        tourneyDB.update_acell('A' + str(self.tourneyID + 1) , str(self.tourneyID))
-        tourneyDB.update_acell('B' + str(self.tourneyID + 1) , '=COUNTIF(GameDatabase!B:B,"="&A' +  str(self.tourneyID + 1) + ')')
+        tourneyDB.update_acell('A' + str(currentTourneyID + 1) , str(currentTourneyID))
+        tourneyDB.update_acell('B' + str(currentTourneyID + 1) , '=COUNTIF(GameDatabase!B:B,"="&A' +  str(currentTourneyID + 1) + ')')
 
 #Check-in button class for checking in to tournaments.
 class CheckinButtons(discord.ui.View):
@@ -1362,7 +988,7 @@ class winnerButtons(discord.ui.View):
         await interaction.response.edit_message(view = self)
         await interaction.followup.send('Committing to DB', ephemeral = True)
 
-        #Write to Database
+        #TODO Write to Database
 
 
         #Command to start check-in
@@ -1387,17 +1013,6 @@ async def checkin(interaction: discord.Interaction):
 
     newTournament = Tournament()
 
-    # Create X lobbies, potentially more than one, need to loop
-
-    newLobby = lobby(newTournament.tourneyID)
-
-    # Wait here for game to finish, somehow
-
-
-
-# Create lobby command
-
-
 #Command to start check for volunteers to sit out of a match.
 @tree.command(
     name = 'sitout',
@@ -1412,7 +1027,20 @@ async def sitout(interaction: discord.Interaction):
     
     view = volunteerButtons()
     await interaction.response.send_message('The Volunteer check has started! You have 15 minutes to volunteer if you wish to sit out.', view = view)
-   
+  
+    
+@tree.command(
+    name = 'create_game',
+    description = 'Create a lobby of 10 players after enough have checked in',
+    guild = discord.Object(GUILD))
+async def create_game(interaction: discord.Interaction):
+    player = interaction.user
+    newLobby = lobby()  
+    await interaction.response.send_message('Creating game...')
+
+
+
+
 async def help_command(interaction: discord.Interaction):
     pages = [
         discord.Embed(
