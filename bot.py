@@ -58,6 +58,41 @@ TIER_GROUPS = os.getenv('TIER_GROUPS', 'UNRANKED,IRON,BRONZE,SILVER:GOLD,PLATINU
 CHECKIN_TIME = os.getenv('CHECKIN_TIME')
 CHECKIN_TIME = int(CHECKIN_TIME)
 
+# The following is all used in matchmaking:
+
+RANK_VALUES = {
+    "challenger": 100, "grandmaster": 97, "master": 94,
+    "diamond": 88, "emerald": 82, "platinum": 75, "gold": 65,
+    "silver": 55, "bronze": 40, "iron": 30, "unranked": 0
+}
+
+ROLE_MODS = {
+    
+    "challenger1": 1.30, "grandmaster1": 1.25, "master1": 1.22,
+    "diamond1": 1.15, "emerald1": 1.07, "platinum1": 1.04, "gold1": 1.00,
+    "silver1": 1.00, "bronze1": 1.00, "iron1": 1.00, "unranked": 1.00,
+
+    "challenger2": 1.25, "grandmaster2": 1.20, "master2": 1.15,
+    "diamond2": 1.10, "emerald2": 1.04, "platinum2": 1.00, "gold2": 1.00,
+    "silver2": .95, "bronze2": .95, "iron2": .95, "unranked": 1.00,
+
+    "challenger3": 1.20, "grandmaster3": 1.15, "master3": 1.20,
+    "diamond3": 1.00, "emerald3": 1.00, "platinum3": .95, "gold3": .90,
+    "silver3": .88, "bronze3": .88, "iron3": .88, "unranked": 1.00,
+
+    "challenger4": 1.05, "grandmaster4": 1.05, "master4": 1.20,
+    "diamond4": .90, "emerald4": .82, "platinum4": .75, "gold4": .70,
+    "silver4": .70, "bronze4": .70, "iron4": .70, "unranked": 1.00,
+
+    "challenger5": 1.00, "grandmaster5": 1.00, "master5": .95,
+    "diamond5": .85, "emerald5": .75, "platinum5": .70, "gold5": .70,
+    "silver5": .70, "bronze5": .70, "iron5": .70, "unranked": 1.00
+    
+    }
+
+randomness = 5 # Used in matchmaking, 5 total points of randomness between scores for players, I.E. a player with 100 base points could be rated as anywhere between 95 and 105 points
+absoluteMaximumDifference = 20 # Also used in matchmaking, this is the largest number of Quality Points a team can differ from the other team and still play
+
 # Adjust event loop policy for Windows
 if platform.system() == "Windows":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -79,6 +114,7 @@ playerDB = googleWorkbook.worksheet('PlayerDatabase')
 # Set up API call to get data from the database
 
 playerAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
+playerAPIRequest2 = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=ROWS&key=' + str(GSHEETS_API))
 gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
@@ -713,46 +749,685 @@ async def rolepreference(interaction: discord.Interaction):
         await interaction.response.send_message("You must have the Player or Volunteer role to set role preferences.", ephemeral=True)
         return
 
-
-
 #Player class.
-class Player:
-    def __init__(self, discord_id, riot_id, rank, role_pref):
-        self.discord_id = discord_id
-        self.riot_id = riot_id
-        self.rank = self.rank_to_value(rank)  # Convert rank to numerical value
-        self.role_pref = role_pref  # List of preferred roles
+class participant():
 
-    @staticmethod
-    def rank_to_value(rank):
-        rank_dict = {"IRON": 1, "BRONZE": 2, "SILVER": 3, "GOLD": 4, "PLATINUM": 5,
-                     "DIAMOND": 6, "EMERALD": 7, "MASTER": 8, "GRANDMASTER": 9, "CHALLENGER": 10}
-        return rank_dict.get(rank.upper(), 1)  # Default to IRON if rank is missing
-        
-    def calculate_weight(self, tier_weight, role_preference_weight):
-        # Calculate weight based on tier, role preference, and a random factor
-        base_weight = self.tier * tier_weight + (
-            self.top_priority +
-            self.jungle_priority +
-            self.mid_priority +
-            self.bot_priority +
-            self.support_priority
-        ) * role_preference_weight
-        
-        return base_weight * self.random_factor  # Add randomness to the final weight
+    def __init__(self,playerName,playerRank,topPreference,jgPreference,midPreference,adcPreference,supPreference):
+
+        self.name = playerName
+        self.rank = playerRank
+        self.baseQualityPoints = RANK_VALUES[self.rank]
+        self.topPreference = topPreference
+        self.topQP = round((self.baseQualityPoints * ROLE_MODS[self.rank + str(self.topPreference)]) + random.uniform(-randomness, randomness),2)
+        self.jgPreference = jgPreference
+        self.jgQP = round((self.baseQualityPoints * ROLE_MODS[self.rank + str(self.jgPreference)]) + random.uniform(-randomness, randomness),2)
+        self.midPreference = midPreference
+        self.midQP = round((self.baseQualityPoints * ROLE_MODS[self.rank + str(self.midPreference)]) + random.uniform(-randomness, randomness),2)
+        self.adcPreference = adcPreference
+        self.adcQP = round((self.baseQualityPoints * ROLE_MODS[self.rank + str(self.adcPreference)]) + random.uniform(-randomness, randomness),2)
+        self.supPreference = supPreference
+        self.supQP = round((self.baseQualityPoints * ROLE_MODS[self.rank + str(self.supPreference)]) + random.uniform(-randomness, randomness),2)
+        self.QPList = [self.topQP,self.jgQP,self.midQP,self.adcQP,self.supQP]
+        self.currentRole = ""
+        self.currentQP = 0
+
+    def updatePlayerQP(self):
+
+        match self.currentRole:
+
+            case "top":
+
+                self.currentQP = self.topQP
+
+            case "jg":
+
+                self.currentQP = self.jgQP
+
+            case "mid":
+
+                self.currentQP = self.midQP
+
+            case "adc":
+
+                self.currentQP = self.adcQP
+
+            case "sup":
+
+                self.currentQP = self.supQP
+
+            case "":
+
+                self.currentQP = 0
  
 #Team class.
-class Team:
-    def __init__(self):
-        self.players = []
-        self.skill_sum = 0
+class team():
 
-    def add_player(self, player):
-        self.players.append(player)
-        self.skill_sum += player.rank
+    def __init__(self,playerList):
 
-    def average_rank(self):
-        return self.skill_sum / len(self.players) if self.players else 0  
+        self.playerList = playerList
+        self.topLaner = playerList[0]
+        self.topLaner.currentRole = "top"
+        self.jgLaner = playerList[1]
+        self.jgLaner.currentRole = "jg"
+        self.midLaner = playerList[2]
+        self.midLaner.currentRole = "mid"
+        self.adcLaner = playerList[3]
+        self.adcLaner.currentRole = "adc"
+        self.supLaner = playerList[4]
+        self.supLaner.currentRole = "sup"
+        self.playerListNames = [self.topLaner.name,self.jgLaner.name,self.midLaner.name,self.adcLaner.name,self.supLaner.name]
+        self.teamTotalQP = round(playerList[0].currentQP + playerList[1].currentQP + playerList[2].currentQP + playerList[3].currentQP + playerList[4].currentQP,2)
+        self.averageTeamQP = round(self.teamTotalQP / len(self.playerList),2)
+        
+    def updateTeamQP(self):
+
+        self.topLaner = self.playerList[0]
+        self.topLaner.currentRole = "top"
+        self.jgLaner = self.playerList[1]
+        self.jgLaner.currentRole = "jg"
+        self.midLaner = self.playerList[2]
+        self.midLaner.currentRole = "mid"
+        self.adcLaner = self.playerList[3]
+        self.adcLaner.currentRole = "adc"
+        self.supLaner = self.playerList[4]
+        self.supLaner.currentRole = "sup"
+
+        for player in self.playerList:
+            player.updatePlayerQP()
+
+        total = 0
+        for x in range(0,len(self.playerList)):
+
+            total += self.playerList[x].currentQP
+
+        self.teamTotalQP = round((total),2)
+        self.averageTeamQP = round(self.teamTotalQP / len(self.playerList),2)
+
+    def assignRole(self,player,role):
+
+        match role:
+
+            case "top":
+
+                self.topLaner = player
+
+            case "jg":
+
+                self.jgLaner = player
+
+            case "mid":
+
+                self.midLaner = player
+
+            case "adc":
+
+                self.adcLaner = player
+
+            case "sup":
+
+                self.supLaner = player
+
+            case "":
+
+                return
+
+    def calculatePotentialQPChange(self,player1,player2):
+
+        player1CurrentQP = player1.currentQP
+        player1NewRole = player2.currentRole
+        player2CurrentQP = player2.currentQP  
+        player2NewRole = player1.currentRole
+
+        match player1NewRole:
+
+            case "top":
+
+                player1PotentialQP = player1.topQP
+
+            case "jg":
+
+                player1PotentialQP = player1.jgQP
+
+            case "mid":
+
+                player1PotentialQP = player1.midQP
+
+            case "adc":
+
+                player1PotentialQP = player1.adcQP
+
+            case "sup":
+
+                player1PotentialQP = player1.supQP
+
+        match player2NewRole:
+
+            case "top":
+
+                player2PotentialQP = player2.topQP
+
+            case "jg":
+
+                player2PotentialQP = player2.jgQP
+
+            case "mid":
+
+                player2PotentialQP = player2.midQP
+
+            case "adc":
+
+                player2PotentialQP = player2.adcQP
+
+            case "sup":
+
+                player2PotentialQP = player2.supQP
+
+        player1Change = player1PotentialQP - player1CurrentQP
+        player2Change = player2PotentialQP - player2CurrentQP
+        
+        # Positive total change here implies the change improves the teams QP.
+        # Negative implies it reduce team QP
+
+        totalChange = player1Change + player2Change
+
+        return totalChange        
+
+    def findLowestQP(self):
+
+        lowest = 1000
+         
+        for player in [self.topLaner, self.jgLaner, self.midLaner, self.adcLaner, self.supLaner]:
+
+            if player.baseQualityPoints < lowest:
+
+                lowestPlayer = player
+                lowest = lowestPlayer.baseQualityPoints
+
+        return lowestPlayer
+
+    def findHighestQP(self):
+
+        highest = 0
+         
+        for player in [self.topLaner, self.jgLaner, self.midLaner, self.adcLaner, self.supLaner]:
+
+            if player.baseQualityPoints > highest:
+
+                highestPlayer = player
+                highest = highestPlayer.baseQualityPoints
+
+        return highestPlayer
+
+    def selfSortMatchmaking(self):
+
+        all_potential_role_assignments = list(itertools.permutations(range(1,6)))
+        best_assignment = None
+        lowest_score = float('inf')
+
+        for potentialAssignment in all_potential_role_assignments:
+            current_score = self.checkScore(potentialAssignment)
+
+            # If we find a lower score, update the best_assignment and lowest_score
+            if current_score < lowest_score:
+                best_assignment = potentialAssignment
+                lowest_score = current_score
+
+        # Return the best assignment found
+        return best_assignment
+
+    def checkScore(self, potentialAssignment):
+        
+        total_score = 0
+        self.playerList = [self.topLaner, self.jgLaner, self.midLaner, self.adcLaner, self.supLaner]
+
+        for z in range(0,len(potentialAssignment)):
+
+            if potentialAssignment[z] == 1:
+
+                total_score += int(self.playerList[z].topPreference)
+
+            elif potentialAssignment[z] == 2:
+
+                total_score += int(self.playerList[z].jgPreference)
+
+            elif potentialAssignment[z] == 3:
+
+                total_score += int(self.playerList[z].midPreference)
+
+            elif potentialAssignment[z] == 4:
+
+                total_score += int(self.playerList[z].adcPreference)
+
+            else:
+
+                total_score += int(self.playerList[z].supPreference)
+
+        return total_score
+
+    def reinstateIdealizedRoles(self):
+
+        idealRoles = self.selfSortMatchmaking()
+        idealTeam = [0,0,0,0,0]
+
+        for x in range(0,len(idealRoles)):
+
+            if idealRoles[x] == 1:
+
+                idealTeam[0] = self.playerList[x]
+
+            elif idealRoles[x] == 2:
+
+                idealTeam[1] = self.playerList[x]
+
+            elif idealRoles[x] == 3:
+
+                idealTeam[2] = self.playerList[x]
+
+            elif idealRoles[x] == 4:
+
+                idealTeam[3] = self.playerList[x]
+
+            elif idealRoles[x] == 5:
+
+                idealTeam[4] = self.playerList[x]
+
+        modifiedTeam = team(idealTeam)
+
+        self.__dict__.update(modifiedTeam.__dict__)
+
+        self.updateTeamQP()
+        
+def formatList(playerList):
+
+    returnableList = []
+
+    for x in range(0,len(playerList),7):
+
+        participantToAdd = participant(playerList[x],playerList[x + 1],playerList[x + 2],playerList[x + 3],playerList[x + 4],playerList[x + 5],playerList[x + 6])
+        print("Adding the following participant to the list of players: " + str(participantToAdd.name))
+        returnableList.append(participantToAdd)   
+
+    return returnableList
+
+def swapPlayerRolesSameTeam(team, player1, player2):
+
+    swap1Role = player1.currentRole
+    swap2Role = player2.currentRole
+
+    match swap1Role:
+
+        case "top":
+
+            team.playerList[0] = player2
+
+        case "jg":
+
+            team.playerList[1] = player2
+
+        case "mid":
+
+            team.playerList[2] = player2
+
+        case "adc":
+
+            team.playerList[3] = player2
+
+        case "sup":
+
+            team.playerList[4] = player2
+
+    match swap2Role:
+
+        case "top":
+
+            team.playerList[0] = player1
+
+        case "jg":
+
+            team.playerList[1] = player1
+
+        case "mid":
+
+            team.playerList[2] = player1
+
+        case "adc":
+
+            team.playerList[3] = player1
+
+        case "sup":
+
+            team.playerList[4] = player1
+
+    team.updateTeamQP()
+
+def swapPlayersToDifferentTeam(player1, team1, player2, team2):
+
+    if player1 in [team1.topLaner,team1.jgLaner,team1.midLaner,team1.adcLaner,team1.supLaner]: # They need to go to team 2
+
+        team2.playerList.append(player1)
+        team1.playerList.append(player2)
+        team2.playerList.remove(player2)
+        team1.playerList.remove(player1)
+
+    else:
+
+        team1.playerList.append(player1)
+        team2.playerList.append(player2)
+        team1.playerList.remove(player2)
+        team2.playerList.remove(player1)
+
+    team1.updateTeamQP()
+    team2.updateTeamQP()
+
+    team1.reinstateIdealizedRoles()
+    team2.reinstateIdealizedRoles()
+
+def matchmake(playerList): # Start by randomizing teams and calculating QP. Then, compare to absoluteMaximumDifference. If 
+# diff is large, swap best and worst players. If diff is above threshold but not as large, un-optimize roles. Continue
+# un-optimizing roles until it's no longer good (and keep last known good).
+
+    keepLooping = True
+
+    while keepLooping == True:
+
+        random.shuffle(playerList)
+
+        team1 = []
+        team2 = []
+
+        for x in range(0,len(playerList),2):
+
+            print("Adding this player to Team 1: " + str(playerList[x].name))
+            team1.append(playerList[x])
+            print("Adding this player to Team 2: " + str(playerList[x + 1].name))
+            team2.append(playerList[x+ 1])
+
+        intermediateTeam1 = team(team1)
+        intermediateTeam1.updateTeamQP()
+
+        intermediateTeam2 = team(team2)
+        intermediateTeam2.updateTeamQP()
+
+        intermediateTeam1.reinstateIdealizedRoles()
+        intermediateTeam2.reinstateIdealizedRoles()
+
+        needsOptimization = True
+        numRuns = 0
+
+        while needsOptimization == True: # Attempt to more balance teams       
+
+            if numRuns > 50:
+
+                break
+
+        # Case 1----------------------------------------------------------------------------------------
+
+            if (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) < 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > 75: # Case 1: A negative difference that is larger than an arbirary large number means that team 2 is better than team 1 and teams are too unbalanced
+                               
+                print("Case 1 is happening")
+                print("Total difference is: ")
+                print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+
+                print('swapping players')
+                print('team 1 before swap: ')
+                print(intermediateTeam1.topLaner.name)
+                print(intermediateTeam1.jgLaner.name)
+                print(intermediateTeam1.midLaner.name)
+                print(intermediateTeam1.adcLaner.name)
+                print(intermediateTeam1.supLaner.name)
+                print('team 2 before swap: ')
+                print(intermediateTeam2.topLaner.name)
+                print(intermediateTeam2.jgLaner.name)
+                print(intermediateTeam2.midLaner.name)
+                print(intermediateTeam2.adcLaner.name)
+                print(intermediateTeam2.supLaner.name)
+                print('worst player on team 1 is: ')
+                print(intermediateTeam1.findLowestQP().name)
+                print('worst player on team 1s role is: ')
+                print(intermediateTeam1.findLowestQP().currentRole)
+                print('best player on team 2 is: ')
+                print(intermediateTeam2.findHighestQP().name)
+                print('best player on team 2s role is: ')
+                print(intermediateTeam2.findHighestQP().currentRole)
+
+                swapPlayersToDifferentTeam(intermediateTeam1.findLowestQP(), intermediateTeam1, intermediateTeam2.findHighestQP(), intermediateTeam2)
+
+                print("swap complete")
+                print('team 1 after swap: ')
+                print(intermediateTeam1.topLaner.name)
+                print(intermediateTeam1.jgLaner.name)
+                print(intermediateTeam1.midLaner.name)
+                print(intermediateTeam1.adcLaner.name)
+                print(intermediateTeam1.supLaner.name)
+                print('team 2 after swap: ')
+                print(intermediateTeam2.topLaner.name)
+                print(intermediateTeam2.jgLaner.name)
+                print(intermediateTeam2.midLaner.name)
+                print(intermediateTeam2.adcLaner.name)
+                print(intermediateTeam2.supLaner.name)
+                print("Total difference is now: ")
+                print(((intermediateTeam1.teamTotalQP) - (intermediateTeam2.teamTotalQP)))
+
+                if (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) < 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference:
+
+                    needsOptimization = True  
+                    print("Still needs work! Case 1 complete")
+                    print("Current QP difference is: ")
+                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)
+
+                    numRuns += 1
+                    
+                else:
+
+                    needsOptimization = False
+                    print("Might be relatively balanced! Case 1 complete")
+                    print("Current QP difference is: ")
+                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)
+
+                    numRuns += 1
+                
+
+        # Case 1----------------------------------------------------------------------------------------
+
+        # Case 2----------------------------------------------------------------------------------------
+    
+            elif (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > 75: # Case 2: A positive difference that is larger than an arbitrary large number means that team 1 is better than team 2 and teams are too unbalanced
+
+                print("Case 2 is happening")
+                print("Total difference is: ")
+                print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+
+                print('swapping players')
+                print('team 1 before swap: ')
+                print(intermediateTeam1.topLaner.name)
+                print(intermediateTeam1.jgLaner.name)
+                print(intermediateTeam1.midLaner.name)
+                print(intermediateTeam1.adcLaner.name)
+                print(intermediateTeam1.supLaner.name)
+                print('team 2 before swap: ')
+                print(intermediateTeam2.topLaner.name)
+                print(intermediateTeam2.jgLaner.name)
+                print(intermediateTeam2.midLaner.name)
+                print(intermediateTeam2.adcLaner.name)
+                print(intermediateTeam2.supLaner.name)
+                print('worst player on team 2 is: ')
+                print(intermediateTeam2.findLowestQP().name)
+                print('worst player on team 2s role is: ')
+                print(intermediateTeam2.findLowestQP().currentRole)
+                print('best player on team 1 is: ')
+                print(intermediateTeam1.findHighestQP().name)
+                print('best player on team 1s role is: ')
+                print(intermediateTeam1.findHighestQP().currentRole)
+
+                swapPlayersToDifferentTeam(intermediateTeam1.findHighestQP(), intermediateTeam1, intermediateTeam2.findLowestQP(), intermediateTeam2)
+
+                print("swap complete")
+                print('team 1 after swap: ')
+                print(intermediateTeam1.topLaner.name)
+                print(intermediateTeam1.jgLaner.name)
+                print(intermediateTeam1.midLaner.name)
+                print(intermediateTeam1.adcLaner.name)
+                print(intermediateTeam1.supLaner.name)
+                print('team 2 after swap: ')
+                print(intermediateTeam2.topLaner.name)
+                print(intermediateTeam2.jgLaner.name)
+                print(intermediateTeam2.midLaner.name)
+                print(intermediateTeam2.adcLaner.name)
+                print(intermediateTeam2.supLaner.name)
+                print("Total difference is now: ")
+                print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+
+                if (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference:
+
+                    needsOptimization = True  
+                    print("Still needs work! Case 2 complete")
+                    print("Current QP difference is: ")
+                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)
+
+                    numRuns += 1
+                    
+                else:
+
+                    needsOptimization = False
+                    print("Might be relatively balanced! Case 2 complete")
+                    print("Current QP difference is: ")
+                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)
+
+                    numRuns += 1
+                
+
+        # Case 2----------------------------------------------------------------------------------------
+
+        # Case 3----------------------------------------------------------------------------------------
+
+            elif (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) < 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference: # Case 3: A negative difference that is larger than the maximum but smaller than an arbitrary large number means that team 2 is better than team 1 and teams are only slightly unbalanced.
+
+                print("Case 3 is happening")
+                print("Total difference before making a swap is: ")
+                print(abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+
+                
+                tries = 0
+                keepLooping = True
+                while keepLooping == True:
+
+                    randomPlayerList = [0,1,2,3,4]
+                    randomChoice1 = random.choice(randomPlayerList)
+                    randomPlayer1 = intermediateTeam2.playerList[randomChoice1]
+                    randomPlayerList.remove(randomChoice1)
+                    randomChoice2 = random.choice(randomPlayerList)
+                    randomPlayer2 = intermediateTeam2.playerList[randomChoice2]
+                    change = intermediateTeam2.calculatePotentialQPChange(randomPlayer1,randomPlayer2)  
+                    print("This is the projected change by swapping")
+                    print(change)
+
+                    if change < 0 and tries < 50: # If the change reduces the QP of the team, which is what we want
+
+                        tries += 1
+                        swapPlayerRolesSameTeam(intermediateTeam2,randomPlayer1,randomPlayer2)
+                        print("Made a swap!")
+                        print("Total difference after making a swap is: ")
+                        print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+                        
+                        if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference and tries < 50:
+
+                            keepLooping = True
+
+                        else:
+
+                            keepLooping = False
+
+                    else:
+
+                        tries += 1
+                        keepLooping = False         
+
+        # Case 3----------------------------------------------------------------------------------------
+
+        # Case 4----------------------------------------------------------------------------------------
+
+            elif (intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > 0 and abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference: # Case 4: A positive difference that is larger than the maximum but smaller than an arbitrary large number means that team 1 is better than team 2 and teams are only slightly unbalanced.
+
+                print("Case 4 is happening")
+                print("Total difference before making a swap is: ")
+                print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+
+                
+                tries = 0
+                keepLooping = True
+                while keepLooping == True:
+
+                    randomPlayerList = [0,1,2,3,4]
+                    randomChoice1 = random.choice(randomPlayerList)
+                    randomPlayer1 = intermediateTeam1.playerList[randomChoice1]
+                    randomPlayerList.remove(randomChoice1)
+                    randomChoice2 = random.choice(randomPlayerList)
+                    randomPlayer2 = intermediateTeam1.playerList[randomChoice2]
+                    change = intermediateTeam1.calculatePotentialQPChange(randomPlayer1,randomPlayer2)   
+                    print("This is the projected change by swapping")
+                    print(change)
+
+                    if change < 0 and tries < 50: # If the change reduces the QP of the team, which is what we want
+
+                        tries += 1
+                        swapPlayerRolesSameTeam(intermediateTeam1,randomPlayer1,randomPlayer2)
+                        print("Made a swap!")
+                        print("Total difference after making a swap is: ")
+                        print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+                        
+                        if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference and tries < 50:
+
+                            keepLooping = True
+
+                        else:
+
+                            keepLooping = False
+
+                    else:
+
+                        tries += 1
+                        keepLooping = False     
+                
+
+        # Case 4----------------------------------------------------------------------------------------
+
+        # Case 5----------------------------------------------------------------------------------------
+
+            else: # Case 5: The difference should now be below AbsoluteMaximumValue, so teams are quite balanced.
+                
+                needsOptimization = False
+                print(str(intermediateTeam1.teamTotalQP) + ' is team 1s points')
+                print(str(intermediateTeam2.teamTotalQP) + ' is team 2s points')
+                print("this is the point differential, which should be less than " + str(absoluteMaximumDifference))
+                print(abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+                print("This is team 1")
+                print(intermediateTeam1.topLaner.name)
+                print(intermediateTeam1.jgLaner.name)
+                print(intermediateTeam1.midLaner.name)
+                print(intermediateTeam1.adcLaner.name)
+                print(intermediateTeam1.supLaner.name)
+                print('This is team 2')
+                print(intermediateTeam2.topLaner.name)
+                print(intermediateTeam2.jgLaner.name)
+                print(intermediateTeam2.midLaner.name)
+                print(intermediateTeam2.adcLaner.name)
+                print(intermediateTeam2.supLaner.name)
+
+                needsOptimization = False
+                keepLooping = False
+                             
+        # Run final checks here (is a Grandmaster facing a gold, somehow?)
+        # TODO
+
+        if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference:
+
+            print("Couldnt make it work, looping through from the beginning.")
+            keepLooping = True
+
+    returnableList = []
+    returnableList.append(intermediateTeam1)
+    returnableList.append(intermediateTeam2)
+    return returnableList
 
 class lobby:
     def __init__(self):
@@ -779,24 +1454,45 @@ class lobby:
         # This part just creates random teams, no real matchmaking yet.
         # TODO - add working matchmaking
 
-        players = playerAPIRequest.json()['values'][0]
+        players = playerAPIRequest2.json()['values']
         players.pop(0)
-        random.shuffle(players)
-        self.playerList = players
 
-        for x in range(0,5):
-            team1.append(players[x])
+        finalPlayerList = []
+        intermediateList = []
 
-        for x in range(6,11):
-            team2.append(players[x])
+        for person in players:
 
-        for x in range(len(team1)):
-            print("")
-            print(str(team1[x]) + " is player " + str(x + 1) + " for team 1.")
+            person.pop(0)
+            participantToAdd = person[:7]
 
-        for x in range(len(team2)):
-            print("")
-            print(str(team2[x]) + " is player " + str(x + 1) + " for team 2.")   
+            for x in range(0,7):
+
+                intermediateList.append(participantToAdd[x])
+
+
+        finalPlayerList = intermediateList[:70]
+     
+        self.playerList = finalPlayerList
+
+        matchmakingList = formatList(finalPlayerList)
+        bothTeams = matchmake(matchmakingList)
+
+        print("")
+        print(str(bothTeams[0].topLaner) + " is player 1 for team 1. They will be playing Top.")
+        print(str(bothTeams[0].jgLaner) + " is player 2 for team 1. They will be playing JG.")
+        print(str(bothTeams[0].midLaner) + " is player 3 for team 1. They will be playing Mid.")
+        print(str(bothTeams[0].adcLaner) + " is player 4 for team 1. They will be playing ADC.")
+        print(str(bothTeams[0].supLaner) + " is player 5 for team 1. They will be playing Sup.")
+
+        print("")
+        print(str(bothTeams[1].topLaner) + " is player 1 for team 2. They will be playing Top.")
+        print(str(bothTeams[1].jgLaner) + " is player 2 for team 2. They will be playing JG.")
+        print(str(bothTeams[1].midLaner) + " is player 3 for team 2. They will be playing Mid.")
+        print(str(bothTeams[1].adcLaner) + " is player 4 for team 2. They will be playing ADC.")
+        print(str(bothTeams[1].supLaner) + " is player 5 for team 2. They will be playing Sup.")
+        
+        team1 = bothTeams[0]
+        team2 = bothTeams[1]
             
         # Write players to database
 
@@ -804,7 +1500,7 @@ class lobby:
 
         gameDB.batch_update([{
     'range': 'E' + str(currentGameID + 1) + ':N' + str(currentGameID + 1),
-    'values': [[str(team1[0]), str(team1[1]),str(team1[2]),str(team1[3]),str(team1[4]),str(team2[0]),str(team2[1]),str(team2[2]),str(team2[3]),str(team2[4])]],
+    'values': [[str(team1.topLaner.name), str(team1.jgLaner.name),str(team1.midLaner.name),str(team1.adcLaner.name),str(team1.supLaner.name),str(team2.topLaner.name),str(team2.jgLaner.name),str(team2.midLaner.name),str(team2.adcLaner.name),str(team2.supLaner.name)]],
 }])
  
 def declareWinner(self,team,gameNumber):
@@ -816,7 +1512,6 @@ def declareMVP(self,gameNumber):
     MVP = "winner"
     return MVP
             
-
 class Tournament:
 
     def __init__(self):
