@@ -1478,18 +1478,18 @@ class lobby:
         bothTeams = matchmake(matchmakingList)
 
         print("")
-        print(str(bothTeams[0].topLaner) + " is player 1 for team 1. They will be playing Top.")
-        print(str(bothTeams[0].jgLaner) + " is player 2 for team 1. They will be playing JG.")
-        print(str(bothTeams[0].midLaner) + " is player 3 for team 1. They will be playing Mid.")
-        print(str(bothTeams[0].adcLaner) + " is player 4 for team 1. They will be playing ADC.")
-        print(str(bothTeams[0].supLaner) + " is player 5 for team 1. They will be playing Sup.")
+        print(str(bothTeams[0].topLaner.name) + " is player 1 for team 1. They will be playing Top.")
+        print(str(bothTeams[0].jgLaner.name) + " is player 2 for team 1. They will be playing JG.")
+        print(str(bothTeams[0].midLaner.name) + " is player 3 for team 1. They will be playing Mid.")
+        print(str(bothTeams[0].adcLaner.name) + " is player 4 for team 1. They will be playing ADC.")
+        print(str(bothTeams[0].supLaner.name) + " is player 5 for team 1. They will be playing Sup.")
 
         print("")
-        print(str(bothTeams[1].topLaner) + " is player 1 for team 2. They will be playing Top.")
-        print(str(bothTeams[1].jgLaner) + " is player 2 for team 2. They will be playing JG.")
-        print(str(bothTeams[1].midLaner) + " is player 3 for team 2. They will be playing Mid.")
-        print(str(bothTeams[1].adcLaner) + " is player 4 for team 2. They will be playing ADC.")
-        print(str(bothTeams[1].supLaner) + " is player 5 for team 2. They will be playing Sup.")
+        print(str(bothTeams[1].topLaner.name) + " is player 1 for team 2. They will be playing Top.")
+        print(str(bothTeams[1].jgLaner.name) + " is player 2 for team 2. They will be playing JG.")
+        print(str(bothTeams[1].midLaner.name) + " is player 3 for team 2. They will be playing Mid.")
+        print(str(bothTeams[1].adcLaner.name) + " is player 4 for team 2. They will be playing ADC.")
+        print(str(bothTeams[1].supLaner.name) + " is player 5 for team 2. They will be playing Sup.")
         
         team1 = bothTeams[0]
         team2 = bothTeams[1]
