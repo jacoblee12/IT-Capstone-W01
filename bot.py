@@ -1796,7 +1796,7 @@ class RiotIDModal(discord.ui.Modal, title="Enter Your Riot ID"):
                 )
 
 @tree.command(
-    name = 'Start Tournament',
+    name = 'start_tournament',
     description = 'Initiate tournament creation',
     guild = discord.Object(GUILD))
 async def startTourney(interaction: discord.Interaction):
