@@ -1450,6 +1450,7 @@ class lobby:
         # Fetch player data from the database
         players = playerAPIRequest2.json()['values']
         players.pop(0)  # Remove the header row
+        random.shuffle(players)
         print("All rows from Google Sheet:")
         for row in players:
             print(row)
