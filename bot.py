@@ -2006,45 +2006,113 @@ async def swap(interaction: discord.Interaction, player1: str, player2: str):
         # Find the players in the teams
         player1_found = None
         player2_found = None
+        player1_team = None
+        player2_team = None
 
-        # Iterate over the playerList attribute of the team object
+        # Search both teams for the players
         for player in team1.playerList:
             if player.name == player1:
                 player1_found = player
-                break
+                player1_team = team1
+            elif player.name == player2:
+                player2_found = player
+                player2_team = team1
 
         for player in team2.playerList:
-            if player.name == player2:
+            if player.name == player1:
+                player1_found = player
+                player1_team = team2
+            elif player.name == player2:
                 player2_found = player
-                break
+                player2_team = team2
 
         # If one or both players are not found, send an error message
         if not player1_found or not player2_found:
             await interaction.response.send_message("❌ One or both players were not found in the teams.", ephemeral=True)
             return
 
-        # Swap the players between teams
-        team1.playerList.remove(player1_found)
-        team2.playerList.remove(player2_found)
+        # Perform the swap
+        if player1_team == team1 and player2_team == team2:
+            team1.playerList.remove(player1_found)
+            team2.playerList.remove(player2_found)
+            team1.playerList.append(player2_found)
+            team2.playerList.append(player1_found)
+        elif player1_team == team2 and player2_team == team1:
+            team2.playerList.remove(player1_found)
+            team1.playerList.remove(player2_found)
+            team2.playerList.append(player2_found)
+            team1.playerList.append(player1_found)
+        else:
+            # If players are on the same team, swap their roles instead
+            swapPlayerRolesSameTeam(player1_team, player1_found, player2_found)
 
-        team1.playerList.append(player2_found)
-        team2.playerList.append(player1_found)
+        # Update team QP
+        team1.updateTeamQP()
+        team2.updateTeamQP()
 
         # Update the global teams
         current_teams["team1"] = team1
         current_teams["team2"] = team2
 
-        # Notify the channel about the swap
-        channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-        await channel.send(f"✅ Admins have swapped **{player1}** and **{player2}** between teams!")
+                # Get current game ID from GameDatabase
+        latest_game_id = gameDB.col_values(1)[-1]
+        if not latest_game_id.isnumeric():
+            await interaction.response.send_message("❌ Could not determine current game ID.", ephemeral=True)
+            return
+        game_row = int(latest_game_id) + 1  # +1 because row 1 is headers
 
-        # Respond to the interaction
-        await interaction.response.send_message(f"✅ Swapped **{player1}** and **{player2}** between teams!", ephemeral=False)
+        # Update GameDatabase
+        gameDB.batch_update([{
+            'range': f'E{game_row}:N{game_row}',
+            'values': [[
+                team1.topLaner.name, team1.jgLaner.name, team1.midLaner.name,
+                team1.adcLaner.name, team1.supLaner.name,
+                team2.topLaner.name, team2.jgLaner.name, team2.midLaner.name,
+                team2.adcLaner.name, team2.supLaner.name
+            ]]
+        }])
+
+        # Format updated team info to match desired output
+        team1_info = (
+            f"**\n"
+            f"Top: {team1.topLaner.name}\n"
+            f"Jungle: {team1.jgLaner.name}\n"
+            f"Mid: {team1.midLaner.name}\n"
+            f"ADC: {team1.adcLaner.name}\n"
+            f"Support: {team1.supLaner.name}"
+        )
+        team2_info = (
+            f"**\n"
+            f"Top: {team2.topLaner.name}\n"
+            f"Jungle: {team2.jgLaner.name}\n"
+            f"Mid: {team2.midLaner.name}\n"
+            f"ADC: {team2.adcLaner.name}\n"
+            f"Support: {team2.supLaner.name}"
+        )
+
+        # Create embed with updated teams
+        embed = discord.Embed(
+            title="Game Lobby Created",
+            description=f"Swapped **{player1}** and **{player2}** between teams!",
+            color=0x00ff00
+        )
+        embed.add_field(name="Team 1", value=team1_info, inline=False)
+        embed.add_field(name="Team 2", value=team2_info, inline=False)
+
+        # Send to notification channel
+        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        await notification_channel.send(embed=embed)
+
+        # Send to the current channel (where command was executed) using followup
+        await interaction.response.send_message(embed=embed)
+        await interaction.followup.send(
+            f"✅ Swapped **{player1}** and **{player2}** between teams!",
+            ephemeral=False
+        )
 
     except Exception as e:
         print(f"Error swapping players: {e}")
         await interaction.response.send_message(f"❌ Error swapping players: {e}", ephemeral=True)
-
 
 @tree.command(
     name="toxicity",
