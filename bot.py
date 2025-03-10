@@ -63,12 +63,6 @@ CHECKIN_TIME = os.getenv('CHECKIN_TIME')
 CHECKIN_TIME = int(CHECKIN_TIME)
 NOTIFICATION_CHANNEL_ID = os.getenv('NOTIFICATION_CHANNEL_ID')
 
-# Set up Google Sheets API TODO UPDATE/REMOVE THIS
-#scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-#creds = Credentials.from_service_account_file("credentials.json", scopes=scope)
-
-
-
 # The following is all used in matchmaking:
 
 RANK_VALUES = {
@@ -136,6 +130,15 @@ gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' +
 tourneyAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(
     GSHEETS_ID) + '/values/TournamentDatabase!A%3AD?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
 
+async def get_friendly_discord_id(discord_id: int, guild: discord.Guild) -> str:
+    """
+    Converts a numeric Discord ID into a friendly username#discriminator format.
+    """
+    member = guild.get_member(discord_id)
+    if member:
+        return f"{member.name}#{member.discriminator}"
+
+    return None
 
 def refreshPlayerData():
     playerDB = googleWorkbook.worksheet('PlayerDatabase')
@@ -283,25 +286,33 @@ async def link(interaction: discord.Interaction, riot_id: str):
                     existing_records = playerDB.get_all_records()
                     discord_id = str(member.id)
                     row_index = None
-                    for i, record in enumerate(existing_records, start=2):
-                        if record["Discord ID"] == discord_id:
+
+                    # Debug: Print all records and the friendly Discord ID being searched
+                    print(f"Searching for friendly Discord ID: {friendly_discord_id}")
+                    print("Existing records:")
+                    for record in existing_records:
+                        print(record)
+
+                    # Search for the player in the database using the friendly Discord ID
+                    for i, record in enumerate(existing_records, start=2):  # Start from row 2 (headers in row 1)
+                        if record.get("Discord ID") == friendly_discord_id:  # Compare using friendly Discord ID
                             row_index = i
                             break
 
                     if row_index:
-                        # Update Riot ID and Rank in Google Sheets
-                        playerDB.update_cell(row_index, 3, rank)  # Rank Tier
-                        playerDB.update_cell(row_index, 2, riot_id)  # Riot ID
+                        # Player already exists in the database, update their Riot ID and rank
+                        playerDB.update_cell(row_index, 2, friendly_discord_id)  # Update friendly Discord ID
+                        playerDB.update_cell(row_index, 3, rank)  # Update Rank Tier
 
                         await interaction.followup.send(
-                            f"Your Riot ID '{riot_id}' has been linked and your rank has been updated to {rank}.",
+                            f"Your Riot ID '{riot_id}' has been updated, and your rank has been updated to {rank}.",
                             ephemeral=True,
                         )
                     else:
-                        # Insert a new record if the player does not exist in the database
+                        # Player does not exist in the database, create a new row
                         new_row = [
                             member.display_name,  # Player Name
-                            discord_id,           # Discord ID
+                            friendly_discord_id,  # Friendly Discord ID
                             rank,                 # Rank Tier
                             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  # Default stats
                         ]
@@ -598,48 +609,82 @@ class RolePreferenceView(discord.ui.View):
     def __init__(self, member_id):
         super().__init__(timeout=60)
         self.member_id = member_id
-        self.role_preferences = {}
-        self.rank_counter = 1  # Track ranking from 1 to 5
-        self.add_item(RolePreferenceDropdown())
-        self.add_item(SubmitButton())
+        self.role_preferences = {}  # Stores the role preferences
+        self.rank_counter = 1  # Tracks the ranking from 1 to 5
+        self.add_item(RolePreferenceDropdown())  # Add the role dropdown
+        self.add_item(SubmitButton())  # Add the submit button
+        self.add_item(BackButton())  # Add the back button
 
     async def update_embed(self, interaction: discord.Interaction):
-        embed = discord.Embed(title="Role Preferences",
-                              description="Select your preferred roles in order. (1 = most preferred, 5 = least preferred)",
-                              color=0xffc629)
+        # Update the embed to reflect the current role preferences
+        embed = discord.Embed(
+            title="Role Preferences",
+            description="Select your preferred roles in order. (1 = most preferred, 5 = least preferred)",
+            color=0xffc629
+        )
         for role, preference in self.role_preferences.items():
             embed.add_field(name=role, value=f"Preference: {preference}", inline=False)
         await interaction.response.edit_message(embed=embed, view=self)
 
     async def save_preferences(self, interaction: discord.Interaction):
         try:
+            # Fetch the friendly Discord ID (username#discriminator)
+            guild = interaction.guild  # Get the guild object from the interaction
+            friendly_discord_id = await get_friendly_discord_id(self.member_id, guild)  # Fetch friendly ID
+            if not friendly_discord_id:  # Check if the friendly ID was fetched successfully
+                await interaction.response.send_message("❌ Could not find your Discord account.", ephemeral=True)
+                return
+
             # Fetch existing records from Google Sheets
             existing_records = playerDB.get_all_records()
-            discord_id = str(self.member_id)  # Convert to string to ensure matching
+
             row_index = None
 
-            # Search for the player using Discord ID
+            # Search for the player using the friendly Discord ID
             for i, record in enumerate(existing_records, start=2):  # Start from row 2 (headers in row 1)
-                if str(record.get("Discord ID")) == discord_id:  # Convert stored ID to string for comparison
+                if record.get("Discord ID") == friendly_discord_id:  # Compare using friendly Discord ID
                     row_index = i
                     break
 
             if row_index:
                 # Save numerical role preferences in the correct columns
                 role_order = ["Top", "Jungle", "Mid", "ADC", "Support"]
-                for idx, role in enumerate(role_order, start=4):
-                    value = self.role_preferences.get(role, "")  # Use self.role_preferences
+                for idx, role in enumerate(role_order, start=4):  # Assuming columns 4-8 are for role preferences
+                    value = self.role_preferences.get(role, 0)  # Use 0 as default if role preference not set
                     playerDB.update_cell(row_index, idx, value)
+
+                # Update the Discord ID column with the friendly ID (if needed)
+                playerDB.update_cell(row_index, 2, friendly_discord_id)  # Column 2 is for the friendly Discord ID
 
                 await interaction.response.send_message("✅ Your role preferences have been saved!", ephemeral=True)
             else:
-                await interaction.response.send_message(
-                    "❌ You are not registered in the database. Please use `/link` first.", ephemeral=True)
+                # Insert a new row if the player doesn't exist in the database
+                row_data = [
+                    interaction.user.display_name,  # Player Name
+                    friendly_discord_id,  # Friendly Discord ID
+                    "N/A",  # Rank Tier (will be updated later)
+                    self.role_preferences.get("Top", 0),  # Role 1 (Top)
+                    self.role_preferences.get("Jungle", 0),  # Role 2 (Jungle)
+                    self.role_preferences.get("Mid", 0),  # Role 3 (Mid)
+                    self.role_preferences.get("ADC", 0),  # Role 4 (ADC)
+                    self.role_preferences.get("Support", 0),  # Role 5 (Support)
+                    0,  # Participation (default to 0)
+                    0,  # Wins (default to 0)
+                    0,  # MVPs (default to 0)
+                    0,  # Toxicity (default to 0)
+                    0,  # Games Played (default to 0)
+                    0,  # WR % (default to 0)
+                    0   # Point Total (default to 0)
+                ]
+                playerDB.append_row(row_data)  # Append new row with friendly ID
+                await interaction.response.send_message("✅ Your role preferences have been saved!", ephemeral=True)
 
         except Exception as e:
             print(f"An error occurred: {e}")
-            await interaction.response.send_message("❌ An unexpected error occurred while saving your preferences.",
-                                                  ephemeral=True)
+            await interaction.response.send_message(
+                "❌ An unexpected error occurred while saving your preferences.", ephemeral=True
+            )
+
 
 
 class RolePreferenceDropdown(discord.ui.Select):
@@ -671,6 +716,23 @@ class SubmitButton(discord.ui.Button):
             await interaction.response.send_message("⚠ Please select all five roles before submitting.", ephemeral=True)
         else:
             await view.save_preferences(interaction)  # Call the save_preferences method
+
+
+class BackButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="Back", style=discord.ButtonStyle.red)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RolePreferenceView = self.view
+        if view.role_preferences:
+            # Remove the last selected role
+            last_role = list(view.role_preferences.keys())[-1]
+            del view.role_preferences[last_role]
+            view.rank_counter -= 1  # Decrement the rank counter
+            await view.update_embed(interaction)  # Update the embed to reflect the changes
+        else:
+            await interaction.response.send_message("No roles to remove.", ephemeral=True)
+
 @tree.command(
     name="rolepreference",
     description="Set your role preferences for matchmaking.",
@@ -1817,11 +1879,43 @@ async def startTourney(interaction: discord.Interaction):
     description="Check in for matchmaking and select your role preferences.",
     guild=discord.Object(GUILD),
 )
+
 async def checkin(interaction: discord.Interaction):
-    view = RolePreferenceView(interaction.user.id)
-    embed = discord.Embed(title="Select Your Role Preferences",
-                          description="Select your roles in order of preference (1 = most preferred, 5 = least preferred).",
-                          color=0xffc629)
+    member = interaction.user
+
+    # Fetch the friendly Discord ID
+    friendly_discord_id = await get_friendly_discord_id(member.id, interaction.guild)
+    if not friendly_discord_id:
+        await interaction.response.send_message("❌ Could not find your Discord account.", ephemeral=True)
+        return
+
+    # Fetch existing records from Google Sheets
+    existing_records = playerDB.get_all_records()
+    row_index = None
+
+    # Debug: Print all records and the friendly Discord ID being searched
+    print(f"Searching for friendly Discord ID: {friendly_discord_id}")
+    print("Existing records:")
+    for record in existing_records:
+        print(record)
+
+    # Search for the user in the database using the friendly Discord ID
+    for i, record in enumerate(existing_records, start=2):
+        if record.get("Discord ID") == friendly_discord_id:  # Compare using friendly Discord ID
+            row_index = i
+            break
+
+    if not row_index:
+        await interaction.response.send_message("❌ You must link your Riot ID first using /link.", ephemeral=True)
+        return
+
+    # Create the role preference view
+    view = RolePreferenceView(member.id)
+    embed = discord.Embed(
+        title="Role Preferences",
+        description="Please rank your preferences for each role (1 = most preferred, 5 = least preferred).",
+        color=0xffc629,
+    )
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 # Command to start check for volunteers to sit out of a match.
