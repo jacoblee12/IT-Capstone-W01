@@ -282,6 +282,12 @@ async def link(interaction: discord.Interaction, riot_id: str):
                     encrypted_summoner_id = await get_encrypted_summoner_id(riot_id)
                     rank = await update_player_rank(str(member.id), encrypted_summoner_id)
 
+                    # Fetch the friendly Discord ID (username#discriminator)
+                    friendly_discord_id = await get_friendly_discord_id(member.id, interaction.guild)
+                    if not friendly_discord_id:
+                        await interaction.followup.send("❌ Could not find your Discord account.", ephemeral=True)
+                        return
+
                     # Fetch existing records from Google Sheets
                     existing_records = playerDB.get_all_records()
                     discord_id = str(member.id)
