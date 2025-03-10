@@ -1906,6 +1906,10 @@ async def checkin(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+    # Send notification to the designated channel
+    channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+    await channel.send("✅ Tournament check-in has started!")
+    
 # Command to start check for volunteers to sit out of a match.
 @tree.command(
     name='sitout',
