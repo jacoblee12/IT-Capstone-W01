@@ -648,42 +648,24 @@ class RolePreferenceView(discord.ui.View):
 
             # Search for the player using the friendly Discord ID
             for i, record in enumerate(existing_records, start=2):  # Start from row 2 (headers in row 1)
-                if record.get("Discord ID") == friendly_discord_id:  # Compare using friendly Discord ID
+                if record.get("Discord ID") == friendly_discord_id:
                     row_index = i
                     break
 
             if row_index:
-                # Save numerical role preferences in the correct columns
+                # Update existing player's role preferences
                 role_order = ["Top", "Jungle", "Mid", "ADC", "Support"]
-                for idx, role in enumerate(role_order, start=4):  # Assuming columns 4-8 are for role preferences
-                    value = self.role_preferences.get(role, 0)  # Use 0 as default if role preference not set
+                for idx, role in enumerate(role_order, start=4):  # Columns 4-8 are for role preferences
+                    value = self.role_preferences.get(role, record.get(role, 0))  # Keep existing value if not updated
                     playerDB.update_cell(row_index, idx, value)
 
-                # Update the Discord ID column with the friendly ID (if needed)
-                playerDB.update_cell(row_index, 2, friendly_discord_id)  # Column 2 is for the friendly Discord ID
-
-                await interaction.response.send_message("✅ Your role preferences have been saved!", ephemeral=True)
+                await interaction.response.send_message("✅ Your role preferences have been updated!", ephemeral=True)
             else:
-                # Insert a new row if the player doesn't exist in the database
-                row_data = [
-                    interaction.user.display_name,  # Player Name
-                    friendly_discord_id,  # Friendly Discord ID
-                    "N/A",  # Rank Tier (will be updated later)
-                    self.role_preferences.get("Top", 0),  # Role 1 (Top)
-                    self.role_preferences.get("Jungle", 0),  # Role 2 (Jungle)
-                    self.role_preferences.get("Mid", 0),  # Role 3 (Mid)
-                    self.role_preferences.get("ADC", 0),  # Role 4 (ADC)
-                    self.role_preferences.get("Support", 0),  # Role 5 (Support)
-                    0,  # Participation (default to 0)
-                    0,  # Wins (default to 0)
-                    0,  # MVPs (default to 0)
-                    0,  # Toxicity (default to 0)
-                    0,  # Games Played (default to 0)
-                    0,  # WR % (default to 0)
-                    0   # Point Total (default to 0)
-                ]
-                playerDB.append_row(row_data)  # Append new row with friendly ID
-                await interaction.response.send_message("✅ Your role preferences have been saved!", ephemeral=True)
+                # Don't create new entry, just inform user they need to link first
+                await interaction.response.send_message(
+                    "❌ You must link your Riot ID using /link before setting role preferences.",
+                    ephemeral=True
+                )
 
         except Exception as e:
             print(f"An error occurred: {e}")
