@@ -64,6 +64,12 @@ CHECKIN_TIME = os.getenv('CHECKIN_TIME')
 CHECKIN_TIME = int(CHECKIN_TIME)
 NOTIFICATION_CHANNEL_ID = os.getenv('NOTIFICATION_CHANNEL_ID')
 
+# Global variables to track MVP votes and game winners
+
+mvp_votes = defaultdict(lambda: defaultdict(int))  # {lobby_id: {player_name: vote_count}}
+game_winners = {}  # {lobby_id: winning_team}
+MVP_VOTE_THRESHOLD = 3  # Configurable minimum vote threshold
+
 # The following is all used in matchmaking:
 
 RANK_VALUES = {
@@ -254,6 +260,284 @@ async def safe_api_call(url, headers):
 
     print("All attempts to connect to the Riot API have failed.")
     return None
+
+class MVPView(discord.ui.View):
+
+    def __init__(self, lobby_id, winning_team_players):
+
+        super().__init__(timeout=180)  # 3-minute timeout for voting
+
+        self.lobby_id = lobby_id
+
+        self.winning_team_players = winning_team_players
+
+        self.add_item(MVPDropdown(winning_team_players))
+
+
+
+class MVPDropdown(discord.ui.Select):
+
+    def __init__(self, winning_team_players):
+
+        options = [discord.SelectOption(label=player.name, value=player.name) for player in winning_team_players]
+
+        super().__init__(placeholder="Select the MVP", options=options)
+
+
+
+    async def callback(self, interaction: discord.Interaction):
+
+        voter = interaction.user.display_name
+
+        selected_mvp = self.values[0]
+
+
+
+        # Prevent players from voting for themselves
+
+        if voter == selected_mvp:
+
+            await interaction.response.send_message("❌ You cannot vote for yourself!", ephemeral=True)
+
+            return
+
+
+
+        # Update MVP votes
+
+        mvp_votes[self.view.lobby_id][selected_mvp] += 1
+
+        await interaction.response.send_message(f"✅ You voted for {selected_mvp} as MVP!", ephemeral=True)
+
+
+
+@tree.command(
+
+    name="mvp",
+
+    description="Vote for the MVP from the winning team.",
+
+    guild=discord.Object(GUILD)
+
+)
+
+async def mvp(interaction: discord.Interaction):
+
+    global current_teams, game_winners
+
+
+
+    # Check if the game has a winner
+
+    lobby_id = gameDB.col_values(1)[-1]  # Get the latest game ID
+
+    if lobby_id not in game_winners:
+
+        await interaction.response.send_message("❌ No winner has been declared for this game yet.", ephemeral=True)
+
+        return
+
+
+
+    # Get the winning team
+
+    winning_team = game_winners[lobby_id]
+
+    winning_team_players = winning_team.playerList
+
+
+
+    # Create the MVP voting view
+
+    view = MVPView(lobby_id, winning_team_players)
+
+    await interaction.response.send_message("Vote for the MVP from the winning team:", view=view, ephemeral=True)
+
+
+
+@tree.command(
+
+    name="gamewinner",
+
+    description="Declare the winning team for the current game (Admin only).",
+
+    guild=discord.Object(GUILD)
+
+)
+
+@commands.has_permissions(administrator=True)
+
+async def gamewinner(interaction: discord.Interaction, winning_team: str):
+
+    global current_teams, game_winners
+
+
+
+    # Validate the winning team input
+
+    if winning_team.lower() not in ["blue", "red"]:
+
+        await interaction.response.send_message("❌ Invalid team. Please specify 'blue' or 'red'.", ephemeral=True)
+
+        return
+
+
+
+    # Get the current lobby ID
+
+    lobby_id = gameDB.col_values(1)[-1]  # Get the latest game ID
+
+    game_row = int(lobby_id) + 1  # Row number in GameDatabase (header is row 1)
+
+
+
+    # Determine the winning team
+
+    if winning_team.lower() == "blue":
+
+        game_winners[lobby_id] = current_teams["team1"]
+
+    else:
+
+        game_winners[lobby_id] = current_teams["team2"]
+
+
+
+    # Update GameDatabase with the winning team
+
+    gameDB.update_acell(f'C{game_row}', winning_team.capitalize())  # Column C is "Winning Team"
+
+
+
+    # Notify the server
+
+    await interaction.response.send_message(f"✅ {winning_team.capitalize()} team has been declared the winner!", ephemeral=False)
+
+
+
+    # Start MVP voting
+
+    winning_team_players = game_winners[lobby_id].playerList
+
+    view = MVPView(lobby_id, winning_team_players)
+
+    await interaction.followup.send("Vote for the MVP from the winning team:", view=view)
+
+
+
+@tree.command(
+
+    name="mvpresult",
+
+    description="Declare the MVP for the current game (Admin only).",
+
+    guild=discord.Object(GUILD)
+
+)
+
+@commands.has_permissions(administrator=True)
+
+async def mvpresult(interaction: discord.Interaction):
+
+    global mvp_votes, game_winners
+
+
+
+    # Get the current lobby ID
+
+    lobby_id = gameDB.col_values(1)[-1]  # Get the latest game ID
+
+    game_row = int(lobby_id) + 1  # Row number in GameDatabase (header is row 1)
+
+
+
+    # Check if there are any MVP votes
+
+    if lobby_id not in mvp_votes or not mvp_votes[lobby_id]:
+
+        await interaction.response.send_message("❌ No MVP votes have been cast for this game.", ephemeral=True)
+
+        return
+
+
+
+    # Find the MVP(s) with the most votes
+
+    max_votes = max(mvp_votes[lobby_id].values())
+
+    mvps = [player for player, votes in mvp_votes[lobby_id].items() if votes == max_votes]
+
+
+
+    # Check if the MVP(s) meet the vote threshold
+
+    if max_votes < MVP_VOTE_THRESHOLD:
+
+        await interaction.response.send_message(f"❌ No MVP has reached the minimum vote threshold of {MVP_VOTE_THRESHOLD}.", ephemeral=True)
+
+        return
+
+
+
+    # Save MVP(s) to GameDatabase and update PlayerDatabase
+
+    existing_records = playerDB.get_all_records()
+
+    if len(mvps) == 1:
+
+        mvp_name = mvps[0]
+
+        gameDB.update_acell(f'D{game_row}', mvp_name)  # Column D is "MVP"
+
+
+
+        # Update MVP count in PlayerDatabase
+
+        for i, record in enumerate(existing_records, start=2):
+
+            if record["Discord ID"] == mvp_name:
+
+                current_mvps = int(record.get("MVPs", 0))
+
+                playerDB.update_cell(i, 11, current_mvps + 1)  # Column K (11) is "MVPs"
+
+                break
+
+
+
+        await interaction.response.send_message(f"🎉 **{mvp_name}** has been declared the MVP with {max_votes} votes!", ephemeral=False)
+
+    else:
+
+        mvp_names = ", ".join(mvps)
+
+        gameDB.update_acell(f'D{game_row}', mvp_names)  # Save co-MVPs as a comma-separated string
+
+
+
+        # Update MVP count for each co-MVP in PlayerDatabase
+
+        for mvp_name in mvps:
+
+            for i, record in enumerate(existing_records, start=2):
+
+                if record["Discord ID"] == mvp_name:
+
+                    current_mvps = int(record.get("MVPs", 0))
+
+                    playerDB.update_cell(i, 11, current_mvps + 1)  # Column K (11) is "MVPs"
+
+                    break
+
+
+
+        await interaction.response.send_message(f"🎉 **{mvp_names}** have been declared co-MVPs with {max_votes} votes each!", ephemeral=False)
+
+
+
+    # Clear MVP votes for this lobby
+
+    mvp_votes[lobby_id].clear()
 
 @tree.command(
     name="link",
