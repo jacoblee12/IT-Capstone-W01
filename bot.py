@@ -276,38 +276,38 @@ class MVPView(discord.ui.View):
 
 
 class MVPDropdown(discord.ui.Select):
-
-    def __init__(self, winning_team_players):
-
+    def init(self, winning_team_players):
         options = [discord.SelectOption(label=player.name, value=player.name) for player in winning_team_players]
-
-        super().__init__(placeholder="Select the MVP", options=options)
-
-
+        super().init(placeholder="Select the MVP", options=options)
+        self.winning_team_players = winning_team_players  # Store for reference in callback
 
     async def callback(self, interaction: discord.Interaction):
+        # Get the voter's Discord ID in username#discriminator format
+        voter_discord_id = f"{interaction.user.name}#{interaction.user.discriminator}"
 
-        voter = interaction.user.display_name
+        # Fetch the voter's name from PlayerDatabase using their Discord ID
+        existing_records = playerDB.get_all_records()
+        voter_name = None
+        for record in existing_records:
+            if record.get("Discord ID") == voter_discord_id:
+                voter_name = record.get("Discord ID")
+                break
 
-        selected_mvp = self.values[0]
-
-
-
-        # Prevent players from voting for themselves
-
-        if voter == selected_mvp:
-
-            await interaction.response.send_message("❌ You cannot vote for yourself!", ephemeral=True)
-
+        if not voter_name:
+            await interaction.response.send_message("❌ Could not find your name in the database. Please link your account with /link.", ephemeral=True)
             return
 
+        # Get the selected MVP's name
+        selected_mvp_name = self.values[0]
 
+        # Prevent self-voting by comparing voter's name (from database) with selected MVP's name
+        if voter_name.lower() == selected_mvp_name.lower():
+            await interaction.response.send_message("❌ You cannot vote for yourself!", ephemeral=True)
+            return
 
-        # Update MVP votes
-
-        mvp_votes[self.view.lobby_id][selected_mvp] += 1
-
-        await interaction.response.send_message(f"✅ You voted for {selected_mvp} as MVP!", ephemeral=True)
+        # Update MVP votes using the player's name
+        mvp_votes[self.view.lobby_id][selected_mvp_name] += 1
+        await interaction.response.send_message(f"✅ You voted for {selected_mvp_name} as MVP!", ephemeral=True)
 
 
 
