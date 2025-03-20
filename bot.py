@@ -129,8 +129,6 @@ playerDB = googleWorkbook.worksheet('PlayerDatabase')
 # Set up API call to get data from the database
 
 playerAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(
-    GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
-playerAPIRequest2 = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(
     GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=ROWS&key=' + str(GSHEETS_API))
 gameAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(
     GSHEETS_ID) + '/values/GameDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
@@ -150,7 +148,7 @@ async def get_friendly_discord_id(discord_id: int, guild: discord.Guild) -> str:
 def refreshPlayerData():
     playerDB = googleWorkbook.worksheet('PlayerDatabase')
     playerAPIRequest = requests.get('https://sheets.googleapis.com/v4/spreadsheets/' + str(
-        GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=COLUMNS&key=' + str(GSHEETS_API))
+    GSHEETS_ID) + '/values/PlayerDatabase!A%3AI?majorDimension=ROWS&key=' + str(GSHEETS_API))
 
 
 def refreshGameData():
@@ -1038,7 +1036,7 @@ class participant():
 
         self.name = playerName
         self.rank = playerRank
-        self.baseQualityPoints = RANK_VALUES[self.rank]
+        self.baseQualityPoints = int(RANK_VALUES[self.rank]) + random.uniform(-randomness,randomness)
         self.topPreference = topPreference
         self.topQP = round(
             (self.baseQualityPoints * ROLE_MODS[self.rank + str(self.topPreference)]) + random.uniform(-randomness,
@@ -1311,7 +1309,6 @@ def isPlayerMatchupValid(player1,player2):
       
         return False
 
-
 def createDummyTeam(teamPlayerList,roleConfiguration):
 
         idealRoles = roleConfiguration
@@ -1454,13 +1451,14 @@ def swapPlayersToDifferentTeam(player1, team1, player2, team2):
 
 def matchmake(
         playerList):  # Start by randomizing teams and calculating QP. Then, compare to absoluteMaximumDifference. If
-    # diff is large, swap best and worst players. If diff is above threshold but not as large, un-optimize roles. Continue
-    # un-optimizing roles until it's no longer good (and keep last known good).
+    # diff is large, swap best and worst players. If diff is above threshold but not as large, swap random players. Continue
+    # swapping until it either works or we need to start over.
 
     keepLooping = True
-
+    totalLoops = 0
     while keepLooping == True:
 
+        totalLoops+=1
         random.shuffle(playerList)
 
         team1 = []
@@ -1483,11 +1481,9 @@ def matchmake(
 
         needsOptimization = True
         numRuns = 0
-
+        plausibleBackupTeam1 = []
+        plausibleBackupTeam2 = []
         while needsOptimization == True:  # Attempt to more balance teams
-
-            if numRuns > 10:
-                break
 
             # Case 1----------------------------------------------------------------------------------------
 
@@ -1556,7 +1552,9 @@ def matchmake(
                     print("Current QP difference is: ")
                     print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)
 
+                if numRuns > 10:
 
+                    break
 
             # Case 1----------------------------------------------------------------------------------------
 
@@ -1625,7 +1623,11 @@ def matchmake(
                     needsOptimization = False
                     print("Might be relatively balanced! Case 2 complete")
                     print("Current QP difference is: ")
-                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)                 
+                    print(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP)    
+                    
+                if numRuns > 10:
+
+                    break
 
             # Case 2----------------------------------------------------------------------------------------
 
@@ -1641,8 +1643,8 @@ def matchmake(
                 print(abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
 
                 tries = 0
-                keepLooping = True
-                while keepLooping == True:
+                keepLoopingInner = True
+                while keepLoopingInner == True:
 
                     tries += 1
                   
@@ -1664,13 +1666,17 @@ def matchmake(
 
                     if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference and tries < 10:
 
-                        keepLooping = True
+                        keepLoopingInner = True
 
                     else:
 
-                        keepLooping = False
+                        keepLoopingInner = False
 
-                        # Case 3----------------------------------------------------------------------------------------
+                if numRuns > 10:
+
+                    break
+
+            # Case 3----------------------------------------------------------------------------------------
 
             # Case 4----------------------------------------------------------------------------------------
 
@@ -1684,8 +1690,8 @@ def matchmake(
                 print((intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
 
                 tries = 0
-                keepLooping = True
-                while keepLooping == True:
+                keepLoopingInner = True
+                while keepLoopingInner == True:
 
                     tries += 1
 
@@ -1707,89 +1713,123 @@ def matchmake(
 
                     if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference and tries < 10:
 
-                        keepLooping = True
+                        keepLoopingInner = True
 
                     else:
 
-                        keepLooping = False
+                        keepLoopingInner = False
 
-                        # Case 4----------------------------------------------------------------------------------------
+                if numRuns > 10:
+
+                    break
+
+            # Case 4----------------------------------------------------------------------------------------
 
             # Case 5----------------------------------------------------------------------------------------
 
             else:  # Case 5: The difference should now be below AbsoluteMaximumValue, so teams are quite balanced.
 
-                numRuns += 1
+                break
+            
+        numRuns += 1
+        needsOptimization = False
+        print(str(intermediateTeam1.teamTotalQP) + ' is team 1s points')
+        print(str(intermediateTeam2.teamTotalQP) + ' is team 2s points')
+        print("this is the point differential, which should be less than " + str(absoluteMaximumDifference))
+        print(abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
+        print("This is team 1")
+        print(intermediateTeam1.topLaner.name)
+        print(intermediateTeam1.jgLaner.name)
+        print(intermediateTeam1.midLaner.name)
+        print(intermediateTeam1.adcLaner.name)
+        print(intermediateTeam1.supLaner.name)
+        print('This is team 2')
+        print(intermediateTeam2.topLaner.name)
+        print(intermediateTeam2.jgLaner.name)
+        print(intermediateTeam2.midLaner.name)
+        print(intermediateTeam2.adcLaner.name)
+        print(intermediateTeam2.supLaner.name)
 
-                needsOptimization = False
-                print(str(intermediateTeam1.teamTotalQP) + ' is team 1s points')
-                print(str(intermediateTeam2.teamTotalQP) + ' is team 2s points')
-                print("this is the point differential, which should be less than " + str(absoluteMaximumDifference))
-                print(abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP))
-                print("This is team 1")
-                print(intermediateTeam1.topLaner.name)
-                print(intermediateTeam1.jgLaner.name)
-                print(intermediateTeam1.midLaner.name)
-                print(intermediateTeam1.adcLaner.name)
-                print(intermediateTeam1.supLaner.name)
-                print('This is team 2')
-                print(intermediateTeam2.topLaner.name)
-                print(intermediateTeam2.jgLaner.name)
-                print(intermediateTeam2.midLaner.name)
-                print(intermediateTeam2.adcLaner.name)
-                print(intermediateTeam2.supLaner.name)
-
-                needsOptimization = False
-                keepLooping = False
+        needsOptimization = False
+        keepLooping = False
 
         # Run final checks here (is a Grandmaster facing a gold, somehow?)
 
-                masterListTeam1 = intermediateTeam1.playerList
-                masterListTeam2 = intermediateTeam2.playerList
+        masterListTeam1 = intermediateTeam1.playerList
+        masterListTeam2 = intermediateTeam2.playerList
 
-                intermediateTeam1.findListOfBestToWorstRoleAssignments()
-                intermediateTeam2.findListOfBestToWorstRoleAssignments()
+        intermediateTeam1.findListOfBestToWorstRoleAssignments()
+        intermediateTeam2.findListOfBestToWorstRoleAssignments()
 
-                team1Configurations = intermediateTeam1.listOfBestToWorstRoleAssignments
-                team2Configurations = intermediateTeam2.listOfBestToWorstRoleAssignments
+        team1Configurations = intermediateTeam1.listOfBestToWorstRoleAssignments
+        team2Configurations = intermediateTeam2.listOfBestToWorstRoleAssignments
 
-                plausibleTeamCombos = []
+        plausibleTeamCombos = []
                 
-                for x in range(0,len(team1Configurations)):
+        for x in range(0,len(team1Configurations)):
 
-                    dummyTeam1 = createDummyTeam(masterListTeam1,team1Configurations[x])
+            dummyTeam1 = createDummyTeam(masterListTeam1,team1Configurations[x])
 
-                    for y in range(0,len(team2Configurations)):
+            for y in range(0,len(team2Configurations)):
 
-                        dummyTeam2 = createDummyTeam(masterListTeam2,team2Configurations[y])
+                dummyTeam2 = createDummyTeam(masterListTeam2,team2Configurations[y])
 
-                        result1 = isPlayerMatchupValid(dummyTeam1.playerList[0],dummyTeam2.playerList[0])
-                        result2 = isPlayerMatchupValid(dummyTeam1.playerList[1],dummyTeam2.playerList[1])
-                        result3 = isPlayerMatchupValid(dummyTeam1.playerList[2],dummyTeam2.playerList[2])
-                        result4 = isPlayerMatchupValid(dummyTeam1.playerList[3],dummyTeam2.playerList[3])
-                        result5 = isPlayerMatchupValid(dummyTeam1.playerList[4],dummyTeam2.playerList[4])
-                        if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
+                result1 = isPlayerMatchupValid(dummyTeam1.playerList[0],dummyTeam2.playerList[0])
+                result2 = isPlayerMatchupValid(dummyTeam1.playerList[1],dummyTeam2.playerList[1])
+                result3 = isPlayerMatchupValid(dummyTeam1.playerList[2],dummyTeam2.playerList[2])
+                result4 = isPlayerMatchupValid(dummyTeam1.playerList[3],dummyTeam2.playerList[3])
+                result5 = isPlayerMatchupValid(dummyTeam1.playerList[4],dummyTeam2.playerList[4])
+                if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
 
-                            plausibleTeamCombos.append([team1Configurations[x],team2Configurations[y]])
+                    plausibleTeamCombos.append([team1Configurations[x],team2Configurations[y]])
 
-                lowestScore = 1000                 
+        lowestScore = 1000     
 
-                for z in range(0, len(plausibleTeamCombos)):
+        for z in range(0, len(plausibleTeamCombos)):
 
-                    plausibleTeam1 = createDummyTeam(masterListTeam1,plausibleTeamCombos[z][0])
-                    plausibleTeam2 = createDummyTeam(masterListTeam2,plausibleTeamCombos[z][1])
-                    #plausibleTeam1 = team(plausibleTeamCombos[x])
-                    #plausibleTeam2 = team(plausibleTeamCombos[x + 1])
+            plausibleTeam1 = createDummyTeam(masterListTeam1,plausibleTeamCombos[z][0])
+            plausibleTeam2 = createDummyTeam(masterListTeam2,plausibleTeamCombos[z][1])
 
-                    matchupScore =  plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
-                    if matchupScore < lowestScore:
+            matchupScore =  plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
+            if matchupScore < lowestScore:
 
-                        bestMatchup = [plausibleTeam1,plausibleTeam2]
-                        lowestScore = matchupScore
+                bestMatchup = [plausibleTeam1,plausibleTeam2]
+                lowestScore = matchupScore
 
-        if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) > absoluteMaximumDifference: 
-            print("Couldnt make it work, looping through from the beginning.")
+                plausibleBackupTeam1.append(plausibleTeam1)
+                plausibleBackupTeam2.append(plausibleTeam2)
+
+        if len(plausibleBackupTeam1) == 0 and totalLoops < 11: # No valid team exists, but we can try to create new random teams.
+
+            print('Trying to loop through from the beginning.')
             keepLooping = True
+
+        elif len(plausibleBackupTeam1) == 0 and totalLoops >= 11: # We have tried, but nothing is valid. Probably due to not valid matchup-able players.
+
+            print("We have tried many times, but no valid team has been created. A backup pair of teams has been presented, but Admins should be aware that these teams may be very imbalanced.")
+            return [intermediateTeam1,intermediateTeam2]
+                       
+        else: # There is at least one valid team, have to find the best matchup between the list of valid teams.
+
+            lowestDiff = 1000
+            finalLowestMatchup = []
+            for x in range(len(plausibleBackupTeam1)):
+
+                for y in range(len(plausibleBackupTeam2)):
+
+                    differenceInSkill = abs(plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[y].teamTotalQP)
+                    if differenceInSkill < lowestDiff:
+
+                        finalLowestMatchup = [plausibleBackupTeam1[x],plausibleBackupTeam2[y]]                   
+                
+            if finalLowestMatchup != []:
+
+                return finalLowestMatchup
+
+            else:
+
+                print("No valid Teams exist, returning random teams in idealized roles.")
+                return [intermediateTeam1,intermediateTeam2]
 
     print("The best matchup is these two teams:")
 
@@ -1841,21 +1881,21 @@ class lobby:
         gameDB.update_acell('B' + str(currentGameID + 1), str(currentTourneyID))
 
         # Fetch player data from the database
-        players = playerAPIRequest2.json()['values']
-        players.pop(0)  # Remove the header row
+        playerDataImport = playerDB.get_all_records()
+        players = []
+        for x in range(0,len(playerDataImport)):
+
+            players.append([playerDataImport[x]['Discord ID'],playerDataImport[x]['Rank Tier'],playerDataImport[x]['Role 1 (Top)'],playerDataImport[x]['Role 2 (Jungle)'],playerDataImport[x]['Role 3 (Mid)'],playerDataImport[x]['Role 4 (ADC)'],playerDataImport[x]['Role 5 (Support)']])
+
         random.shuffle(players)
-        print("All rows from Google Sheet:")
-        for row in players:
-            print(row)
 
         # Prepare the player list for matchmaking
         finalPlayerList = []
         intermediateList = []
 
         for person in players:
-            person.pop(0)  # Remove the first column, leaving 7 player data elements
-            participantToAdd = person[:7]  # Extract relevant player data
-            intermediateList.extend(participantToAdd)
+            
+            intermediateList.extend(person)
 
         finalPlayerList = intermediateList[:70]  # Grabs first 70 elements, 10 players with 7 elements each.
         # Name, rank, role1, role2, role3, role4, role5
@@ -2277,6 +2317,10 @@ async def create_game(interaction: discord.Interaction):
     try:
         player = interaction.user
         await interaction.response.send_message('Creating game...', ephemeral=True)
+
+        refreshGameData()
+        refreshPlayerData()
+        refreshTourneyData()
 
         # Create a new lobby
         newLobby = lobby()
