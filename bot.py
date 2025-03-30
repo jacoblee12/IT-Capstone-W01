@@ -78,7 +78,7 @@ TIER_VALUES = {
     "4": 65, "5": 50
 }
 
-ROLE_MODS = { # The first number is the tier, the second is the role preference. For example, a tier 2 player in their 2nd worst role is 2,4 and receives a QP modifier of 1.05
+ROLE_MODS = { # The first number is the tier, the second is the role preference. a tier 2 player in their 4th best role is 2,4 and receives a QP modifier of 1.05
 
     "1,1": 1.30, "2,1": 1.25, "3,1": 1.22,
     "4,1": 1.15, "5,1": 1.07,
