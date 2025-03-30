@@ -1,4 +1,4 @@
-                                                                            # KSU Esports Tournament Bot Guide
+              KSU Esports Tournament Bot Guide
 
 For Players
 
