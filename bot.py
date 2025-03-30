@@ -2057,7 +2057,7 @@ class lobby:
         for person in players:
             intermediateList.extend(person)
 
-        finalPlayerList = intermediateList[:80]  # Grabs first 70 elements, 10 players with 8 elements each.
+        finalPlayerList = intermediateList[:80]  # Grabs first 80 elements, 10 players with 8 elements each.
         # Name, rank, role1, role2, role3, role4, role5
 
         # Format the player list for matchmaking
