@@ -33,9 +33,13 @@ For Admins
 Installation Instructions (How to Add Bot to Server)
 1. **Invite the Bot**:
    - Go to the Discord Developer Portal (https://discord.com/developers/applications).
-   - Create a new application and add a bot user.
-   - Generate an invite link with the following permissions: `bot` scope, `applications.commands` scope, and permissions like `Manage Roles`, `Send Messages`, `Embed Links`, and `Read Message History`.
-   - Use the invite link to add the bot to your server.
+   - Click create a new application 
+   -Click the Installation tab and under “guild install” click the drop down and add a bot user.
+   - Generate an invite link (under installation tab) with the following permissions: `bot` scope, `applications.commands` scope, and give the bot administrator permissions under “guild installs”.
+   - Click on the three lines in the top left corner and click on Bot
+   - Scroll down and ensure that the bot has presence, server members, and message contents intent checked on
+   - Paste the bot invite link in your address bar to add the bot to your server.
+   - Inside Discord ensure that you have developer mode enabled (user settings>Advanced)
 2. **Set Up Environment**:
    - Clone the bot’s GitHub repository (assuming it’s hosted there).
    - Rename `.env.template` to `.env` and fill in the required variables (see Configuration Options below).
@@ -43,14 +47,41 @@ Installation Instructions (How to Add Bot to Server)
 3. **Run the Bot**:
    - Run `python bot.py` from the command line in the bot’s directory.
    - Ensure the bot has a role higher than `Player` and `Volunteer` roles in the server’s role hierarchy.
+  
+Google Sheets Integration
 
-Configuration Options
-Edit the `.env` file with these variables:
-- **`BOT_TOKEN`**: Your Discord bot token from the Developer Portal.
-- **`GUILD_TOKEN`**: The ID of your Discord server (right-click server > Copy ID).
+The bot uses Google Sheets to store data related to players, games, and tournaments. Follow these steps to correctly configure and integrate Google Sheets:
+Setting Up Google Cloud Credentials
+To integrate Google Sheets with the bot, you must first create a Google Cloud Project and generate API credentials:
+1. Create or Select a Project:
+  - Visit Google Cloud Console.
+  - Create a new project or select an existing one.
+2.	Enable the Google Sheets API:
+  - Navigate to APIs & Services → Library.
+  - Search for and enable Google Sheets API.
+3. Create Service Account Credentials:
+  - Navigate to IAM & Admin → Service Accounts.
+  - Click Create Service Account, assign a relevant name, and continue.
+  - Assign the Editor or Viewer role
+  - Click Done to complete creation.
+  - After creation click on the service account and navigate to keys
+  - Generate a new key (this will be your gspread_service_account file, ensure it is named that and saved in same folder as the bot)
+**The email that is generated from the service account must be shared with the master Google sheets
+4. Getting the GSheets API Key
+  - Navigate back to the credentials screen and click create credential 
+  - Create a new API Key
+  - After generating, copy the displayed key and paste that into your env file.
+5. Integrate JSON file with the Bot:
+  - Move the downloaded JSON file to a secure location on your system.
+  - Update the path in Bot2.py (line ~113) to reference the exact location of your JSON file (e.g., C:/path/to/your/gspread_service_account.json).
+
+.env Configuration Options
+Edit the `.env` file with these variables in a plain text document or in an IDE (i.e Visual Studio code):
+- **`BOT_TOKEN`**: Your Discord bot token from the Developer Portal (Bot tab> Reset Token>copy the token).
+- **`GUILD_TOKEN`**: The ID of your Discord server (right-click Discord server > Copy ID).
 - **`RIOT_API_KEY`**: Your Riot Games API key (get from https://developer.riotgames.com/).
-- **`GSHEETS_API`**: Google Sheets API key.
-- **`GSHEETS_ID`**: Google Spreadsheet ID for the main workbook.
+- **`GSHEETS_API`**: Google Sheets API key (see Google Sheets integration).
+- **`GSHEETS_ID`**: Google Spreadsheet ID for the main workbook(after "/d/" and before "/edit" in the url).
 - **`GHSEETS_GAMEDB`**: Worksheet name for game data (default: `GameDatabase`).
 - **`GSHEETS_PLAYERDB`**: Worksheet name for player data (default: `PlayerDatabase`).
 - **`GSHEETS_TOURNAMENTDB`**: Worksheet name for tournament data (default: `TournamentDatabase`).
@@ -108,7 +139,7 @@ Key Classes and Methods
 - **`team`**: Manages a 5-player team with role assignments and QP calculations.
   - `updateTeamQP()`: Recalculates team QP after changes.
   - `selfSortMatchmaking()`: Optimizes role assignments within the team.
-- **`lobby`**: Creates a game with two teams and updates the database.
+- **`lobby`**: Creates a game with two teams and updates the database.  
 - **`Tournament`**: Initializes a tournament and tracks its ID.
 - **`matchmake(playerList)`**: Balances two teams based on QP and role preferences.
 - **`safe_api_call(url, headers)`**: Handles Riot API requests with retries and timeouts.
