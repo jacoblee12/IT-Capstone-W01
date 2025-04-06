@@ -109,14 +109,14 @@ TIER_VALUES = {
 TIER_MAPPING = {
     "CHALLENGER": "1",
     "GRANDMASTER": "1",
-    "MASTER": "1",
+    "MASTER": "2",
     "DIAMOND": "2",
     "EMERALD": "3",
     "PLATINUM": "4",
     "GOLD": "5",
     "SILVER": "6",
-    "BRONZE": "6",
-    "IRON": "6"
+    "BRONZE": "7",
+    "IRON": "7"
 }
 
 randomness = 5  # Used in matchmaking, 5 total points of randomness between scores for players, I.E. a player with 100 base points could be rated as anywhere between 95 and 105 points
