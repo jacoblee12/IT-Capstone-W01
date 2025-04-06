@@ -19,6 +19,9 @@ from openpyxl import load_workbook
 import aiohttp
 import os
 import sys
+import asyncio
+import time
+from collections import deque
 import platform
 import random
 import traceback
@@ -28,6 +31,7 @@ import operator
 import random
 import gspread
 import gspread.utils
+from discord.ext import tasks
 import time
 from functools import wraps
 from gspread.utils import ValueRenderOption
@@ -37,6 +41,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from google.oauth2.service_account import Credentials
+
+
 
 load_dotenv(find_dotenv())
 intents = discord.Intents.default()
@@ -69,10 +75,11 @@ TIER_GROUPS = os.getenv('TIER_GROUPS',
                         'UNRANKED,IRON,BRONZE,SILVER:GOLD,PLATINUM:EMERALD:DIAMOND:MASTER:GRANDMASTER:CHALLENGER')  # Setting default tier configuration if left blank in .env
 CHECKIN_TIME = os.getenv('CHECKIN_TIME')
 CHECKIN_TIME = int(CHECKIN_TIME)
+
 NOTIFICATION_CHANNEL_ID = os.getenv('NOTIFICATION_CHANNEL_ID')
 
-# Global variables to track MVP votes and game winners
 
+# Global variables to track MVP votes and game winners
 mvp_votes = defaultdict(lambda: defaultdict(int))  # {lobby_id: {player_name: vote_count}}
 game_winners = {}  # {lobby_id: winning_team}
 MVP_VOTE_THRESHOLD = 3  # Minimum votes needed to win MVP
@@ -88,9 +95,28 @@ MVP_VOTE_THRESHOLD = 3  # Configurable minimum vote threshold
 
 # The following is all used in matchmaking:
 
+# Adjust TIER_VALUES to reflect 1-6 for ranked tiers
 TIER_VALUES = {
-    "1": 100, "2": 97, "3": 93,
-    "4": 87, "5": 78, "6": 68, "7": 55
+    "1": 100,  # Challenger/Grandmaster/Master
+    "2": 97,   # Diamond
+    "3": 93,   # Emerald
+    "4": 87,   # Platinum
+    "5": 78,   # Gold
+    "6": 68    # Silver/Bronze/Iron
+    # "UNRANKED" will be handled as a string, no numerical value needed
+}
+# Tier mapping for ranked tiers only
+TIER_MAPPING = {
+    "CHALLENGER": "1",
+    "GRANDMASTER": "1",
+    "MASTER": "1",
+    "DIAMOND": "2",
+    "EMERALD": "3",
+    "PLATINUM": "4",
+    "GOLD": "5",
+    "SILVER": "6",
+    "BRONZE": "6",
+    "IRON": "6"
 }
 
 randomness = 5  # Used in matchmaking, 5 total points of randomness between scores for players, I.E. a player with 100 base points could be rated as anywhere between 95 and 105 points
@@ -110,40 +136,40 @@ session = None
 
 # Set up gspread for access by functions
 
-gc = gspread.service_account(filename='C:\\Users\\Jacob\\source\\repos\\KSU Capstone Project\\KSU Capstone Project\\gspread_service_account.json')
+gc = gspread.service_account(filename='C:\\Users\\trist\\Downloads\\testing the install\\gspread_service_account.json')
 googleWorkbook = gc.open_by_key(GSHEETS_ID)
 
 tourneyDB = googleWorkbook.worksheet('TournamentDatabase')
 gameDB = googleWorkbook.worksheet('GameDatabase')
 playerDB = googleWorkbook.worksheet('PlayerDatabase')
 
-# Rate limiter decorator
-def rate_limited(max_per_minute):
-    min_interval = 60.0 / max_per_minute
-    def decorator(func):
-        last_called = [0.0]
-        @wraps(func)
-        async def wrapped(*args, **kwargs):
-            elapsed = time.time() - last_called[0]
-            wait = min_interval - elapsed
-            if wait > 0:
-                time.sleep(wait)
-            last_called[0] = time.time()
-            return await func(*args, **kwargs)
-        return wrapped
-    return decorator
 
-# Apply to Sheet operations
-@rate_limited(60)  # 60 requests per minute
-async def safe_sheet_update(sheet, *args, **kwargs):
-    try:
-        return sheet.update(*args, **kwargs)
-    except gspread.exceptions.APIError as e:
-        if 'quota' in str(e).lower():
-            print("Hit rate limit, waiting...")
-            time.sleep(60)
-            return safe_sheet_update(sheet, *args, **kwargs)
-        raise
+class GoogleSheetsRateLimiter:
+    def __init__(self, max_calls=30, period=60):  # Reduced from 45 to 30
+        self.max_calls = max_calls
+        self.period = period
+        self.calls = deque()
+        self.lock = asyncio.Lock()
+        self.last_retry_time = 0
+    async def __aenter__(self):
+        async with self.lock:
+            now = time.time()
+            # Remove calls older than our period
+            while self.calls and self.calls[0] <= now - self.period:
+                self.calls.popleft()
+
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.period - (now - self.calls[0])
+                await asyncio.sleep(max(0, sleep_time))
+                return await self.__aenter__()  # Retry after sleeping
+
+            self.calls.append(now)
+            return self
+    async def __aexit__(self, exc_type, exc, tb):
+        pass
+
+# Initialize the rate limiter
+sheets_limiter = GoogleSheetsRateLimiter(max_calls=45, period=60)  # Conservative limit
 
 def get_admin_mention(guild: discord.Guild) -> str:
     """Returns a string that mentions all administrators"""
@@ -152,6 +178,7 @@ def get_admin_mention(guild: discord.Guild) -> str:
         if member.guild_permissions.administrator:
             admin_mentions.append(member.mention)
     return " ".join(admin_mentions) if admin_mentions else "@admin"
+
 
 async def get_friendly_discord_id(discord_id: int, guild: discord.Guild) -> str:
     """
@@ -163,45 +190,49 @@ async def get_friendly_discord_id(discord_id: int, guild: discord.Guild) -> str:
 
     return None
 
-async def safe_sheet_fetch(sheet, max_retries=3):
-    """Fetch sheet data with retry logic"""
+async def safe_sheet_update(sheet, *args, **kwargs):
+    max_retries = 5
+    base_delay = 1  # seconds
+
     for attempt in range(max_retries):
         try:
-            return sheet.get_all_records()
+            async with sheets_limiter:
+                return sheet.update(*args, **kwargs)
         except gspread.exceptions.APIError as e:
-            if attempt == max_retries - 1:
-                raise
-            wait = (attempt + 1) * 10  # Exponential backoff
-            print(f"API Error (attempt {attempt + 1}), retrying in {wait} seconds...")
-            await asyncio.sleep(wait)
-
+            if 'quota' in str(e).lower():
+                    wait_time = min(base_delay * (2 ** attempt), 60)  # Cap at 60 seconds
+                    print(f"Hit rate limit (attempt {attempt + 1}), waiting {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+            raise
+    raise Exception(f"Failed after {max_retries} retries")
 
 async def batch_sheet_update(sheet, updates):
-    """Update multiple cells in a single batch"""
-    try:
-        # Group updates by row to minimize API calls
-        update_batches = {}
-        for row, col, value in updates:
-            if row not in update_batches:
-                update_batches[row] = {}
-            update_batches[row][col] = value
+    async with sheets_limiter:
+        try:
+            # Group updates by row to minimize API calls
+            update_batches = {}
+            for row, col, value in updates:
+                if row not in update_batches:
+                    update_batches[row] = {}
+                update_batches[row][col] = value
 
-        # Process batches
-        for row, cols in update_batches.items():
-            range_start = gspread.utils.rowcol_to_a1(row, min(cols.keys()))
-            range_end = gspread.utils.rowcol_to_a1(row, max(cols.keys()))
-            cell_list = sheet.range(f"{range_start}:{range_end}")
+            # Process batches
+            for row, cols in update_batches.items():
+                range_start = gspread.utils.rowcol_to_a1(row, min(cols.keys()))
+                range_end = gspread.utils.rowcol_to_a1(row, max(cols.keys()))
+                cell_list = sheet.range(f"{range_start}:{range_end}")
 
-            for cell in cell_list:
-                if cell.col in cols:
-                    cell.value = cols[cell.col]
+                for cell in cell_list:
+                    if cell.col in cols:
+                        cell.value = cols[cell.col]
 
-            await asyncio.sleep(1)  # Rate limiting
-            sheet.update_cells(cell_list)
+                await asyncio.sleep(1)  # Additional rate limiting
+                sheet.update_cells(cell_list)
 
-    except Exception as e:
-        print(f"Error in batch update: {str(e)}")
-        raise
+        except Exception as e:
+            print(f"Error in batch update: {str(e)}")
+            raise
 
 # On bot ready event
 @client.event
@@ -305,10 +336,10 @@ async def safe_api_call(url, headers):
 class MVPView(discord.ui.View):
 
     def __init__(self, lobby_id, winning_team_players):
-
         super().__init__(timeout=180)  # 3-minute timeout
         self.lobby_id = lobby_id
         self.add_item(MVPDropdown(winning_team_players, lobby_id))
+
 
 class MVPDropdown(discord.ui.Select):
     def __init__(self, winning_team_players, lobby_id):
@@ -368,6 +399,7 @@ class MVPDropdown(discord.ui.Select):
                 ephemeral=True
             )
 
+
 @tree.command(
     name="mvp",
     description="Vote for the MVP from the winning team",
@@ -422,38 +454,53 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
     try:
         await interaction.response.defer()
 
-        # Enhanced team validation with database fallback
-        if not current_teams or not current_teams.get("team1") or not current_teams.get("team2"):
-            # Try to recover teams from database
-            try:
-                lobby_id = gameDB.col_values(1)[-1]
-                if lobby_id.isdigit():
-                    game_row = int(lobby_id) + 1
-                    game_data = gameDB.row_values(game_row)
-                    if len(game_data) >= 14:  # Ensure we have all player columns
-                        # Get player names from database
-                        team1_players = game_data[4:9]  # Columns E-I (Team 1)
-                        team2_players = game_data[9:14]  # Columns J-N (Team 2)
+        # 1. Validate and load game data
+        try:
+            # Get all games and find the most recent unfinished game
+            all_games = gameDB.get_all_values()
+            if len(all_games) < 2:  # Header + at least one game
+                raise ValueError("No games found in database")
 
-                        # Reconstruct player objects
-                        team1 = team([participant(name, "UNRANKED", 0, 0, 0, 0, 0) for name in team1_players])
-                        team2 = team([participant(name, "UNRANKED", 0, 0, 0, 0, 0) for name in team2_players])
+            latest_game = None
+            for row in reversed(all_games[1:]):
+                if len(row) >= 3 and not row[2]:  # Column C (Winner) is empty
+                    latest_game = row
+                    break
 
-                        current_teams = {
-                            "team1": team1,
-                            "team2": team2
-                        }
-            except Exception as e:
-                print(f"Error trying to recover teams from database: {e}")
+            if not latest_game:
+                raise ValueError("No active games found (all have winners)")
 
-            if not current_teams or not current_teams.get("team1") or not current_teams.get("team2"):
-                await interaction.followup.send(
-                    "❌ No active game found! Please create teams first with /create_game.",
-                    ephemeral=True
-                )
-                return
+            lobby_id = latest_game[0]
+            game_row = all_games.index(latest_game) + 1  # Convert to 1-based index
 
-        # Validate team selection
+            # Reconstruct teams from database
+            team1_players = latest_game[4:9]  # Columns E-I
+            team2_players = latest_game[9:14]  # Columns J-N
+
+            # Get actual player ranks from database
+            def get_player_rank(name):
+                records = playerDB.get_all_records()
+                for r in records:
+                    if r["Players1"] == name:
+                        return r.get("Rank Tier", "UNRANKED")
+                return "UNRANKED"
+
+            team1 = team([participant(name, get_player_rank(name), 0, 0, 0, 0, 0)
+                          for name in team1_players if name])
+            team2 = team([participant(name, get_player_rank(name), 0, 0, 0, 0, 0)
+                          for name in team2_players if name])
+
+            current_teams = {"team1": team1, "team2": team2}
+
+        except Exception as e:
+            print(f"Game loading error: {str(e)}")
+            await interaction.followup.send(
+                f"❌ Could not load game: {str(e)}",
+                ephemeral=True
+            )
+            return
+
+        # 2. Validate team selection
         winning_team = winning_team.lower()
         if winning_team not in ["blue", "red"]:
             await interaction.followup.send(
@@ -462,123 +509,101 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
             )
             return
 
-        # Get current game ID safely
+        # 3. Process winner
+        winning_team_obj = current_teams["team1"] if winning_team == "blue" else current_teams["team2"]
+        game_winners[lobby_id] = winning_team_obj
+
+        # 4. Prepare all updates
+        updates = []
+
+        # Game database update
+        updates.append({
+            "sheet": gameDB,
+            "updates": [(game_row, 3, winning_team.capitalize())]  # Column C
+        })
+
+        # Player updates
+        player_updates = []
+        all_players = current_teams["team1"].playerList + current_teams["team2"].playerList
+        winning_players = winning_team_obj.playerList
+
+        existing_records = playerDB.get_all_records()
+        for i, record in enumerate(existing_records, start=2):
+            if record["Players1"] in [p.name for p in all_players]:
+                is_winner = record["Players1"] in [p.name for p in winning_players]
+                games = int(record.get("Games Played", 0)) + 1
+                wins = int(record.get("Wins", 0)) + (1 if is_winner else 0)
+
+                player_updates.extend([
+                    (i, 9, int(record.get("Current Participation", 0)) + 1),
+                    (i, 10, int(record.get("Total Participation", 0)) + 1),
+                    (i, 14, games),
+                    (i, 11, wins),
+                    (i, 15, round(wins / max(1, games), 2))
+                ])
+
+        if player_updates:
+            updates.append({
+                "sheet": playerDB,
+                "updates": player_updates
+            })
+
+        # 5. Execute updates with rate limiting and retries
         try:
-            lobby_id = gameDB.col_values(1)[-1]  # Get latest game ID
-            if not lobby_id.isdigit():
-                raise ValueError("Invalid game ID")
-            game_row = int(lobby_id) + 1
-        except Exception as e:
-            print(f"Error getting game ID: {e}")
-            await interaction.followup.send(
-                "❌ Could not determine current game. Please try again.",
-                ephemeral=True
+            for update in updates:
+                await execute_with_retry(
+                    batch_sheet_update,
+                    update["sheet"],
+                    update["updates"],
+                    max_retries=3,
+                    delay=10
+                )
+
+            # 6. Send success response
+            embed = discord.Embed(
+                title=f"🏆 {winning_team.capitalize()} Team Wins!",
+                description="\n".join([f"• {player.name}" for player in winning_players]),
+                color=0x3498db if winning_team == "blue" else 0xe74c3c
             )
-            return
+            embed.add_field(name="Game ID", value=lobby_id)
 
-        # Determine winning team
-        try:
-            if winning_team == "blue":
-                winning_team_obj = current_teams["team1"]
-            else:
-                winning_team_obj = current_teams["team2"]
-
-            winning_team_players = winning_team_obj.playerList
-            game_winners[lobby_id] = winning_team_obj
-        except AttributeError as e:
-            print(f"Error accessing team data: {e}")
-            await interaction.followup.send(
-                "❌ Team data is corrupted. Please recreate the game.",
-                ephemeral=True
-            )
-            return
-
-        # Update game database
-        try:
-            gameDB.update_cell(game_row, 3, winning_team.capitalize())  # Column C (3) is Winner
-        except Exception as e:
-            print(f"Error updating game DB: {e}")
-            await interaction.followup.send(
-                "❌ Failed to update game record. Check console for details.",
-                ephemeral=True
-            )
-            return
-            # Update participation for all players
-        try:
-            all_players = current_teams["team1"].playerList + current_teams["team2"].playerList
-            for player in all_players:
-                is_winner = (winning_team.lower() == "blue" and player in current_teams["team1"].playerList) or \
-                            (winning_team.lower() == "red" and player in current_teams["team2"].playerList)
-                await update_participation(player.name, is_winner)
-        except Exception as e:
-            print(f"Error updating participation: {e}")
-
-        # Update wins for winning team
-        try:
-            for player in winning_team_players:
-                existing_records = playerDB.get_all_records()
-                for i, record in enumerate(existing_records, start=2):
-                    if record.get("Players1") == player.name:
-                        current_wins = int(record.get("Wins", 0))
-                        playerDB.update_cell(i, 11, current_wins + 1)  # Column K (11) is Wins
-                        break
-        except Exception as e:
-            print(f"Error updating wins: {e}")
-
-        # Adjust tiers
-        try:
-            await adjust_tiers()
-        except Exception as e:
-            print(f"Error adjusting tiers: {e}")
-
-        # Send announcement to notification channel
-        try:
             notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
             if notification_channel:
-                winning_team_name = winning_team.capitalize()
-                player_names = "\n".join([f"• {player.name}" for player in winning_team_players])
-
-                embed = discord.Embed(
-                    title=f"🏆 {winning_team_name} Team Wins!",
-                    description=f"**Congratulations to:**\n{player_names}",
-                    color=0x3498db if winning_team == "blue" else 0xe74c3c
-                )
-                embed.add_field(
-                    name="Game ID",
-                    value=lobby_id,
-                    inline=False
-                )
-                embed.set_thumbnail(url="https://i.imgur.com/t7k6Z2F.png")  # Add your trophy icon
-
                 await notification_channel.send(embed=embed)
-        except Exception as e:
-            print(f"Error sending notification: {e}")
 
-        # Create and send MVP voting
-        try:
-            view = MVPView(lobby_id, winning_team_players)
             await interaction.followup.send(
-                f"✅ {winning_team.capitalize()} team declared winner!",
+                embed=embed,
+                content=f"✅ {winning_team.capitalize()} team declared winner!",
                 ephemeral=False
             )
-            await interaction.followup.send(
-                "Vote for MVP from the winning team:",
-                view=view
-            )
+
         except Exception as e:
-            print(f"Error creating MVP vote: {e}")
+            print(f"Update failed after retries: {str(e)}")
             await interaction.followup.send(
-                "✅ Winner declared but MVP voting failed to start.",
+                "❌ Failed to update records after multiple attempts. Please try again later.",
                 ephemeral=True
             )
 
     except Exception as e:
-        print(f"Unexpected error in gamewinner: {e}")
+        print(f"Unexpected error in gamewinner: {str(e)}")
         await interaction.followup.send(
             "❌ An unexpected error occurred. Check console for details.",
             ephemeral=True
         )
 
+
+async def execute_with_retry(func, *args, max_retries=3, delay=5, **kwargs):
+    for attempt in range(max_retries):
+        try:
+            return await func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            if 'quota' in str(e).lower():
+                wait = delay * (attempt + 1)
+                print(f"Rate limited, retrying in {wait} seconds (attempt {attempt + 1})")
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise Exception(f"Failed after {max_retries} retries")
 @tree.command(
     name="mvpresult",
     description="Declare the MVP for the current game (Admin only).",
@@ -757,6 +782,8 @@ class MVPDropdown(discord.ui.Select):
                 f"✅ You voted for {selected_mvp} (Total votes: {current_votes}/{MVP_VOTE_THRESHOLD})",
                 ephemeral=True
             )
+
+
 @tree.command(
     name="link",
     description="Link your Riot ID to your Discord account and update rank.",
@@ -824,7 +851,7 @@ async def link(interaction: discord.Interaction, riot_id: str):
                             member.display_name,  # Player Name
                             friendly_discord_id,  # Friendly Discord ID
                             rank,  # Rank Tier
-                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   # Default stats
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # Default stats
                         ]
                         playerDB.append_row(new_row)
 
@@ -852,6 +879,8 @@ async def link(interaction: discord.Interaction, riot_id: str):
         await interaction.followup.send(
             "An unexpected error occurred while linking your Riot ID.", ephemeral=True
         )
+
+
 async def get_encrypted_summoner_id(riot_id):
     """Fetches the encrypted summoner ID from Riot API using Riot ID."""
     if "#" not in riot_id:
@@ -871,9 +900,11 @@ async def get_encrypted_summoner_id(riot_id):
 
     return None
 
-
 async def update_player_rank(discord_id, encrypted_summoner_id):
-    """Fetches the player's rank from Riot API and updates Google Sheets."""
+    """
+    Fetches the player's rank from Riot API, updates Google Sheets with the numerical tier (1-6),
+    and returns the same numerical tier or 'UNRANKED'.
+    """
     await asyncio.sleep(3)  # Small delay to avoid rate-limiting
 
     url = f"https://na1.api.riotgames.com/lol/league/v4/entries/by-summoner/{encrypted_summoner_id}"
@@ -888,9 +919,10 @@ async def update_player_rank(discord_id, encrypted_summoner_id):
 
                     for entry in data:
                         if entry.get("queueType") == "RANKED_SOLO_5x5":
-                            rank = f"{entry.get('tier', 'UNRANKED')} {entry.get('rank', '')}".strip()
+                            tier = entry.get("tier", "UNRANKED").upper()
+                            numerical_tier = TIER_MAPPING.get(tier, "UNRANKED")
 
-                            # Fetch existing records from Google Sheets
+                            # Update Google Sheets with the numerical tier (1-6)
                             existing_records = playerDB.get_all_records()
                             row_index = None
                             for i, record in enumerate(existing_records, start=2):
@@ -899,17 +931,20 @@ async def update_player_rank(discord_id, encrypted_summoner_id):
                                     break
 
                             if row_index:
-                                # Update Rank Tier in Google Sheets
-                                playerDB.update_cell(row_index, 3, rank)  # Column 3 is "Rank Tier"
-                                print(f"Updated Rank Tier for {discord_id} to {rank}")
+                                playerDB.update_cell(row_index, 3, str(numerical_tier))  # Store as string if needed
+                                print(f"Updated Rank Tier for {discord_id} to {numerical_tier}")
 
-                            return rank
+                            return numerical_tier  # Return numerical value (1-6)
 
                     return "UNRANKED"  # Default if no rank is found
 
+                else:
+                    print(f"API Error: {response.status}, {await response.text()}")
+                    return "UNRANKED"  # Unranked on API error
+
     except Exception as e:
         print(f"Error fetching player rank: {e}")
-        return "N/A"
+        return "UNRANKED"  # Unranked on exception
 
 @tree.command(
     name='stats',
@@ -1145,6 +1180,7 @@ async def update_tier_based_on_winrate(discord_id):
                 playerDB.update_cell(i, 3, new_tier.capitalize())
             break
 
+
 @tree.command(
     name="set_tier",
     description="Manually set a player's tier (Admin only).",
@@ -1154,7 +1190,8 @@ async def update_tier_based_on_winrate(discord_id):
 async def set_tier(interaction: discord.Interaction, player: discord.Member, tier: str):
     valid_tiers = TIER_VALUES.keys()
     if tier not in valid_tiers:
-        await interaction.response.send_message(f"❌ Invalid tier. Valid options: {', '.join(valid_tiers)}", ephemeral=True)
+        await interaction.response.send_message(f"❌ Invalid tier. Valid options: {', '.join(valid_tiers)}",
+                                                ephemeral=True)
         return
 
     try:
@@ -1197,6 +1234,7 @@ async def set_tier(interaction: discord.Interaction, player: discord.Member, tie
             "❌ Failed to update tier. Please try again.",
             ephemeral=True
         )
+
 
 class RolePreferenceView(discord.ui.View):
     def __init__(self, member_id):
@@ -1332,11 +1370,12 @@ async def rolepreference(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+
 async def update_participation(player_name: str, is_winner: bool = False, points: int = 1):
     """Update all player statistics including participation, wins, and games played"""
     try:
         # Refresh player data to get latest values
-        
+
         existing_records = playerDB.get_all_records()
 
         for i, record in enumerate(existing_records, start=2):  # Start from row 2
@@ -1390,8 +1429,8 @@ async def adjust_tiers():
             "grandmaster", "challenger"
         ]
 
-        # Use safe sheet fetching with rate limiting
-        existing_records = await safe_sheet_fetch(playerDB)
+        # Use a safe sheet fetching with rate limiting
+        existing_records = await GoogleSheetsRateLimiter(playerDB)
 
         # Batch updates to reduce API calls
         updates = []
@@ -1466,28 +1505,30 @@ async def adjust_tiers():
     except Exception as e:
         print(f"System error in adjust_tiers(): {str(e)}")
         raise
+
+
 # Player class.
 class participant():
 
     def __init__(self, playerName, playerTier, topPreference, jgPreference, midPreference, adcPreference,
                  supPreference):
-
         self.name = playerName
         self.tier = playerTier
         self.baseQualityPoints = int(TIER_VALUES[str(self.tier)]) + random.uniform(-randomness, randomness)
         self.topPreference = topPreference
-        self.topQP = self.baseQualityPoints + random.uniform(-randomness,randomness)
+        self.topQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.jgPreference = jgPreference
-        self.jgQP = self.baseQualityPoints + random.uniform(-randomness,randomness)
+        self.jgQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.midPreference = midPreference
-        self.midQP = self.baseQualityPoints + random.uniform(-randomness,randomness)
+        self.midQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.adcPreference = adcPreference
-        self.adcQP = self.baseQualityPoints + random.uniform(-randomness,randomness)
+        self.adcQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.supPreference = supPreference
-        self.supQP = self.baseQualityPoints + random.uniform(-randomness,randomness)
+        self.supQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.QPList = [self.topQP, self.jgQP, self.midQP, self.adcQP, self.supQP]
         self.currentRole = ""
         self.currentQP = 0
+
 
 # Team class.
 class team():
@@ -1681,36 +1722,36 @@ class team():
 
         self.__dict__.update(modifiedTeam.__dict__)
 
-        self.updateTeamQP() 
+        self.updateTeamQP()
 
-def isPlayerMatchupValidMostRestrictive(player1, player2): 
 
+def isPlayerMatchupValidMostRestrictive(player1, player2):
     # This is the most restrictive checks. If a team passes these tests, they will be quite balanced.
 
     # Tiers are closely tied to rank. Tier 1 is GM/Challenger, Tier 2 is Master/Diamond
     # Tier 3 is Emerald, Tier 4 is Platinum, Tier 5 is Gold, Tier 6 is Silver, Tier 7 is Bronze/Iron
 
-    if player1.tier == 1 and player2.tier == 1: # GM and Challenger Players can play vs each other.
+    if player1.tier == 1 and player2.tier == 1:  # GM and Challenger Players can play vs each other.
 
         return True
 
-    elif player1.tier == 2 and player2.tier == 2: # Masters and Diamonds can play vs each other.
+    elif player1.tier == 2 and player2.tier == 2:  # Masters and Diamonds can play vs each other.
 
         return True
 
-    elif player1.tier  in [3,4] and player2.tier in [3,4]: # Emerald and Platinum can play vs each other.
+    elif player1.tier in [3, 4] and player2.tier in [3, 4]:  # Emerald and Platinum can play vs each other.
 
         return True
 
-    elif player1.tier in [4,5] and player2.tier in [4,5]: # Platinum and Gold can play vs each other.
+    elif player1.tier in [4, 5] and player2.tier in [4, 5]:  # Platinum and Gold can play vs each other.
 
         return True
 
-    elif player1.tier in [5,6] and player2.tier in [5,6]: # Gold and Silver can play against each other.
+    elif player1.tier in [5, 6] and player2.tier in [5, 6]:  # Gold and Silver can play against each other.
 
         return True
 
-    elif player1.tier in [7] and player2.tier in [7]: # Bronze and Iron can play against each other.
+    elif player1.tier in [7] and player2.tier in [7]:  # Bronze and Iron can play against each other.
 
         return True
 
@@ -1718,30 +1759,30 @@ def isPlayerMatchupValidMostRestrictive(player1, player2):
 
         return False
 
-def isPlayerMatchupValidMediumRestrictive(player1, player2):
 
+def isPlayerMatchupValidMediumRestrictive(player1, player2):
     # This is the medium-level restrictive checks. If a team passes these tests, they will still probably be decent teams.
 
     # Tiers are closely tied to rank. Tier 1 is GM/Challenger, Tier 2 is Master/Diamond
     # Tier 3 is Emerald, Tier 4 is Platinum, Tier 5 is Gold, Tier 6 is Silver, Tier 7 is Bronze/Iron
 
-    if player1.tier == 1 and player2.tier == 1: # GM and Challenger Players can play vs each other.
+    if player1.tier == 1 and player2.tier == 1:  # GM and Challenger Players can play vs each other.
 
         return True
 
-    elif player1.tier == 2 and player2.tier == 2: # Masters and Diamonds can play vs each other.
+    elif player1.tier == 2 and player2.tier == 2:  # Masters and Diamonds can play vs each other.
 
         return True
 
-    elif player1.tier  in [3,4] and player2.tier in [3,4]: # Emerald and Platinum can play vs each other.
+    elif player1.tier in [3, 4] and player2.tier in [3, 4]:  # Emerald and Platinum can play vs each other.
 
         return True
 
-    elif player1.tier in [4,5,6] and player2.tier in [4,5,6]: # Platinum, Gold, and Silver can play vs each other.
+    elif player1.tier in [4, 5, 6] and player2.tier in [4, 5, 6]:  # Platinum, Gold, and Silver can play vs each other.
 
         return True
 
-    elif player1.tier in [6,7] and player2.tier in [6,7]: # Silver Bronze, and Iron can play against each other.
+    elif player1.tier in [6, 7] and player2.tier in [6, 7]:  # Silver Bronze, and Iron can play against each other.
 
         return True
 
@@ -1749,30 +1790,33 @@ def isPlayerMatchupValidMediumRestrictive(player1, player2):
 
         return False
 
-def isPlayerMatchupValidLowRestrictive(player1, player2):
 
+def isPlayerMatchupValidLowRestrictive(player1, player2):
     # This is the low-restriction checks. Teams will, on average, be less balanced here.
-    
+
     # Tiers are closely tied to rank. Tier 1 is GM/Challenger, Tier 2 is Master/Diamond
     # Tier 3 is Emerald, Tier 4 is Platinum, Tier 5 is Gold, Tier 6 is Silver, Tier 7 is Bronze/Iron
 
-    if player1.tier in [1,2] and player2.tier in [1,2]: # GM, Challenger, Master, and Diamond players can all play together.
+    if player1.tier in [1, 2] and player2.tier in [1,
+                                                   2]:  # GM, Challenger, Master, and Diamond players can all play together.
 
         return True
 
-    elif player1.tier in [2,3] and player2.tier in [2,3]: # Masters, Diamonds and Emeralds can play vs each other. They can also match up one or down one tier.
+    elif player1.tier in [2, 3] and player2.tier in [2,
+                                                     3]:  # Masters, Diamonds and Emeralds can play vs each other. They can also match up one or down one tier.
 
         return True
 
-    elif player1.tier in [3,4,5] and player2.tier in [3,4,5]: # Emerald, Platinum, and Gold can play vs each other.
+    elif player1.tier in [3, 4, 5] and player2.tier in [3, 4, 5]:  # Emerald, Platinum, and Gold can play vs each other.
 
         return True
 
-    elif player1.tier in [4,5,6] and player2.tier in [4,5,6]: # Platinum, Gold, and Silver can play against each other.
+    elif player1.tier in [4, 5, 6] and player2.tier in [4, 5,
+                                                        6]:  # Platinum, Gold, and Silver can play against each other.
 
         return True
 
-    elif player1.tier in [6,7] and player2.tier in [6,7]: # Silver Bronze, and Iron can play against each other.
+    elif player1.tier in [6, 7] and player2.tier in [6, 7]:  # Silver Bronze, and Iron can play against each other.
 
         return True
 
@@ -1780,32 +1824,36 @@ def isPlayerMatchupValidLowRestrictive(player1, player2):
 
         return False
 
-def isPlayerMatchupValidLeastRestrictive(player1, player2):
 
+def isPlayerMatchupValidLeastRestrictive(player1, player2):
     # This is the lowest restriction checks. Teams will, on average, be much less balanced here.
 
     # Tiers are closely tied to rank. Tier 1 is GM/Challenger, Tier 2 is Master/Diamond
     # Tier 3 is Emerald, Tier 4 is Platinum, Tier 5 is Gold, Tier 6 is Silver, Tier 7 is Bronze/Iron
 
-    if player1.tier in [1,2] and player2.tier in [1,2]: # GM, Challenger, Master, and Diamond players can all play together.
+    if player1.tier in [1, 2] and player2.tier in [1,
+                                                   2]:  # GM, Challenger, Master, and Diamond players can all play together.
 
         return True
 
-    elif player1.tier in [2,3,4] and player2.tier in [2,3,4]: # Masters, Diamonds and Emeralds can play vs each other.
+    elif player1.tier in [2, 3, 4] and player2.tier in [2, 3,
+                                                        4]:  # Masters, Diamonds and Emeralds can play vs each other.
 
         return True
 
-    elif player1.tier in [3,4,5,6] and player2.tier in [3,4,5,6]: # Emerald, Platinum, Gold, and Silver can play against each other.
+    elif player1.tier in [3, 4, 5, 6] and player2.tier in [3, 4, 5,
+                                                           6]:  # Emerald, Platinum, Gold, and Silver can play against each other.
 
         return True
 
-    elif player1.tier in [6,7] and player2.tier in [6,7]: # Silver Bronze, and Iron can play against each other.
+    elif player1.tier in [6, 7] and player2.tier in [6, 7]:  # Silver Bronze, and Iron can play against each other.
 
         return True
 
     else:
 
         return False
+
 
 def createDummyTeam(teamPlayerList, roleConfiguration):
     idealRoles = roleConfiguration
@@ -1846,7 +1894,7 @@ def createDummyTeam(teamPlayerList, roleConfiguration):
     return modifiedTeam
 
 
-def formatList(playerList): # Takes in player data and turns them into player objects.
+def formatList(playerList):  # Takes in player data and turns them into player objects.
     returnableList = []
     # Ensure the playerList has the correct number of columns (7 per player)
     for x in range(0, len(playerList), 7):
@@ -1915,7 +1963,7 @@ def save_teams_to_sheet(teams):
         first_empty_row = len(all_rows) + 1
 
         # Update the worksheet
-        gameDB.update(          
+        gameDB.update(
             [row_data],
             f"A{first_empty_row}:N{first_empty_row}",
             value_input_option="USER_ENTERED"
@@ -1926,6 +1974,7 @@ def save_teams_to_sheet(teams):
     except Exception as e:
         print(f"Error saving to GameDatabase: {e}")
         raise
+
 
 def swapPlayerRolesSameTeam(team, player1, player2):
     swap1Role = player1.currentRole
@@ -2047,8 +2096,7 @@ async def send_team_embed(interaction, team1, team2, is_balanced=True):
     await interaction.followup.send(embed=embed)
 
 
-async def optimizeTeams(team1,team2):
-
+async def optimizeTeams(team1, team2):
     caseNumber = 0
 
     # Case 1----------------------------------------------------------------------------------------
@@ -2084,7 +2132,7 @@ async def optimizeTeams(team1,team2):
         print(team2.findHighestQP().currentRole)
 
         swapPlayersToDifferentTeam(team1.findLowestQP(), team1,
-                                    team2.findHighestQP(), team2)
+                                   team2.findHighestQP(), team2)
 
         print("swap complete")
         print('team 1 after swap: ')
@@ -2152,7 +2200,7 @@ async def optimizeTeams(team1,team2):
         print(team1.findHighestQP().currentRole)
 
         swapPlayersToDifferentTeam(team1.findHighestQP(), team1,
-                                    team2.findLowestQP(), team2)
+                                   team2.findLowestQP(), team2)
 
         print("swap complete")
         print('team 1 after swap: ')
@@ -2198,10 +2246,10 @@ async def optimizeTeams(team1,team2):
         print(abs(team1.teamTotalQP - team2.teamTotalQP))
 
         team1List = [team1.topLaner, team1.jgLaner, team1.midLaner,
-                        team1.adcLaner, team1.supLaner]
+                     team1.adcLaner, team1.supLaner]
         team1WorstToBest = (sorted(team1List, key=lambda x: x.baseQualityPoints))
         team2List = [team2.topLaner, team2.jgLaner, team2.midLaner,
-                        team2.adcLaner, team2.supLaner]
+                     team2.adcLaner, team2.supLaner]
         team2WorstToBest = (sorted(team2List, key=lambda x: x.baseQualityPoints))
 
         randomPlayerTeam1 = team1WorstToBest[2:]
@@ -2228,10 +2276,10 @@ async def optimizeTeams(team1,team2):
         print((team1.teamTotalQP - team2.teamTotalQP))
 
         team1List = [team1.topLaner, team1.jgLaner, team1.midLaner,
-                        team1.adcLaner, team1.supLaner]
+                     team1.adcLaner, team1.supLaner]
         team1WorstToBest = (sorted(team1List, key=lambda x: x.baseQualityPoints))
         team2List = [team2.topLaner, team2.jgLaner, team2.midLaner,
-                        team2.adcLaner, team2.supLaner]
+                     team2.adcLaner, team2.supLaner]
         team2WorstToBest = (sorted(team2List, key=lambda x: x.baseQualityPoints))
 
         randomPlayerTeam1 = team1WorstToBest[:2]
@@ -2247,10 +2295,12 @@ async def optimizeTeams(team1,team2):
 
     # Case 4----------------------------------------------------------------------------------------
 
-    return[team1,team2]
+    return [team1, team2]
+
 
 async def matchmake(interaction: discord.Interaction, playerList):
     """Matchmake players into balanced teams and send Discord embeds with results."""
+
     # Start by randomizing teams and calculating QP. Then, compare to absoluteMaximumDifference. If
     # diff is large, swap best and worst players. If diff is above threshold but not as large, swap random players. Continue
     # swapping until it either works, we need to start over with freshly randomized teams, or we reach a certain loop threshold.
@@ -2265,7 +2315,7 @@ async def matchmake(interaction: discord.Interaction, playerList):
         )
 
     keepLooping = True
-    totalOuterLoops = 0  
+    totalOuterLoops = 0
     while keepLooping == True:
 
         print("This is the total loopage")
@@ -2295,11 +2345,11 @@ async def matchmake(interaction: discord.Interaction, playerList):
         if totalOuterLoops > 20:
 
             warning_embed = discord.Embed(
-            title="⚠️ Warning: Matchmaking Failed",
-            description="Matchmaking couldn't create teams after multiple attempts.\n"
-                        "These teams are simply randomized from the pool of potential players, and are likely unbalanced:",
-            color=0xffcc00  # Yellow for warning
-        )
+                title="⚠️ Warning: Matchmaking Failed",
+                description="Matchmaking couldn't create teams after multiple attempts.\n"
+                            "These teams are simply randomized from the pool of potential players, and are likely unbalanced:",
+                color=0xffcc00  # Yellow for warning
+            )
 
             warning_embed.add_field(
                 name="🔷 Team 1",
@@ -2329,11 +2379,10 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                 numRuns += 1
 
-                optimizedTeams = await optimizeTeams(intermediateTeam1,intermediateTeam2)
+                optimizedTeams = await optimizeTeams(intermediateTeam1, intermediateTeam2)
 
                 if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) <= absoluteMaximumDifference or numRuns >= 7:
-
-                    needsOptimization = False # Stop the loops
+                    needsOptimization = False  # Stop the loops
                     break
 
             if abs(intermediateTeam1.teamTotalQP - intermediateTeam2.teamTotalQP) < absoluteMaximumDifference and totalOuterLoops < 20:
@@ -2341,7 +2390,7 @@ async def matchmake(interaction: discord.Interaction, playerList):
                 print(str(intermediateTeam1.teamTotalQP) + ' is team 1s points')
                 print(str(intermediateTeam2.teamTotalQP) + ' is team 2s points')
 
-            # Run final checks here (is a Grandmaster facing a gold, somehow?)
+                # Run final checks here (is a Grandmaster facing a gold, somehow?)
 
                 masterListTeam1 = intermediateTeam1.playerList
                 masterListTeam2 = intermediateTeam2.playerList
@@ -2357,7 +2406,7 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                 # Step 1: Create "dummy" teams with all possible combinations of teams.
                 # Step 2: Check for "plausibility" by checking each lane matchup within the teams.
-                # Step 3: If the team is valid, add to list of plausible teams. 
+                # Step 3: If the team is valid, add to list of plausible teams.
                 # Step 4: Find "best" team within all plausible teams. "Best" is defined as the lowest
                 # sum of all role preference scores I.E. a lower score means more players got more preferred roles.
 
@@ -2365,7 +2414,7 @@ async def matchmake(interaction: discord.Interaction, playerList):
                 # order from most to least restrictive. Ideally, the most restrictive will create
                 # a team first, but if not the others will kick in.
 
-                for x in range(0, len(team1Configurations)): # Step 1
+                for x in range(0, len(team1Configurations)):  # Step 1
 
                     dummyTeam1 = createDummyTeam(masterListTeam1, team1Configurations[x])
 
@@ -2373,35 +2422,40 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                         dummyTeam2 = createDummyTeam(masterListTeam2, team2Configurations[y])
 
-                        result1 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[0], dummyTeam2.playerList[0])
-                        result2 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[1], dummyTeam2.playerList[1])
-                        result3 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[2], dummyTeam2.playerList[2])
-                        result4 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[3], dummyTeam2.playerList[3])
-                        result5 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[4], dummyTeam2.playerList[4])
+                        result1 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[0],
+                                                                      dummyTeam2.playerList[0])
+                        result2 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[1],
+                                                                      dummyTeam2.playerList[1])
+                        result3 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[2],
+                                                                      dummyTeam2.playerList[2])
+                        result4 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[3],
+                                                                      dummyTeam2.playerList[3])
+                        result5 = isPlayerMatchupValidMostRestrictive(dummyTeam1.playerList[4],
+                                                                      dummyTeam2.playerList[4])
                         if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
                             plausibleTeamCombos.append([team1Configurations[x], team2Configurations[y]])
 
                 lowestScore = 1000
 
-                for z in range(0, len(plausibleTeamCombos)): # Step 2
+                for z in range(0, len(plausibleTeamCombos)):  # Step 2
 
                     plausibleTeam1 = createDummyTeam(masterListTeam1, plausibleTeamCombos[z][0])
                     plausibleTeam2 = createDummyTeam(masterListTeam2, plausibleTeamCombos[z][1])
 
                     matchupScore = plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
                     if matchupScore < lowestScore:
-
                         lowestScore = matchupScore
-                        plausibleBackupTeam1.append(plausibleTeam1) # Step 3
-                        plausibleBackupTeam2.append(plausibleTeam2)                       
+                        plausibleBackupTeam1.append(plausibleTeam1)  # Step 3
+                        plausibleBackupTeam2.append(plausibleTeam2)
 
-                if len(plausibleBackupTeam1) != 0: # A valid team exists! Step 4
+                if len(plausibleBackupTeam1) != 0:  # A valid team exists! Step 4
 
                     print('Teams reached level 0 relaxing')
                     lowestDiff = 1000
                     finalLowestMatchup = []
                     for x in range(len(plausibleBackupTeam1)):
-                        differenceInSkill = abs(plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
+                        differenceInSkill = abs(
+                            plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
                         if differenceInSkill < lowestDiff:
                             finalLowestMatchup = [plausibleBackupTeam1[x], plausibleBackupTeam2[x]]
                             lowestDiff = differenceInSkill
@@ -2425,15 +2479,16 @@ async def matchmake(interaction: discord.Interaction, playerList):
                         )
 
                         try:
-                            notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
+                            notification_channel = client.get_channel(
+                                int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
                             if notification_channel:
                                 await notification_channel.send("A team has been created!")
                                 await notification_channel.send(embed=success_embed)
-                                return[finalLowestMatchup[0],finalLowestMatchup[1]]
+                                return [finalLowestMatchup[0], finalLowestMatchup[1]]
                         except Exception as e:
-                            print(f"Couldn't send to notification channel: {e}")                       
+                            print(f"Couldn't send to notification channel: {e}")
 
-                else: # A valid team does not exist, relax restrictions a bit.
+                else:  # A valid team does not exist, relax restrictions a bit.
 
                     print('Teams reached level 1 relaxing')
                     for x in range(0, len(team1Configurations)):
@@ -2444,11 +2499,16 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                             dummyTeam2 = createDummyTeam(masterListTeam2, team2Configurations[y])
 
-                            result1 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[0], dummyTeam2.playerList[0])
-                            result2 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[1], dummyTeam2.playerList[1])
-                            result3 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[2], dummyTeam2.playerList[2])
-                            result4 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[3], dummyTeam2.playerList[3])
-                            result5 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[4], dummyTeam2.playerList[4])
+                            result1 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[0],
+                                                                            dummyTeam2.playerList[0])
+                            result2 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[1],
+                                                                            dummyTeam2.playerList[1])
+                            result3 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[2],
+                                                                            dummyTeam2.playerList[2])
+                            result4 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[3],
+                                                                            dummyTeam2.playerList[3])
+                            result5 = isPlayerMatchupValidMediumRestrictive(dummyTeam1.playerList[4],
+                                                                            dummyTeam2.playerList[4])
                             if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
                                 plausibleTeamCombos.append([team1Configurations[x], team2Configurations[y]])
 
@@ -2461,48 +2521,49 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                         matchupScore = plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
                         if matchupScore < lowestScore:
-
                             lowestScore = matchupScore
                             plausibleBackupTeam1.append(plausibleTeam1)
                             plausibleBackupTeam2.append(plausibleTeam2)
 
-                    if len(plausibleBackupTeam1) != 0: # A valid team exists!
+                    if len(plausibleBackupTeam1) != 0:  # A valid team exists!
 
                         lowestDiff = 1000
                         finalLowestMatchup = []
                         for x in range(len(plausibleBackupTeam1)):
-                            differenceInSkill = abs(plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
+                            differenceInSkill = abs(
+                                plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
                             if differenceInSkill < lowestDiff:
                                 finalLowestMatchup = [plausibleBackupTeam1[x], plausibleBackupTeam2[x]]
                                 lowestDiff = differenceInSkill
 
                         if finalLowestMatchup:
                             success_embed = discord.Embed(
-                            title="✅ Balanced Teams Created",
-                            description="Matchmaking created balanced teams successfully!",
-                            color=0x00ff00  # Green for success
-                        )
+                                title="✅ Balanced Teams Created",
+                                description="Matchmaking created balanced teams successfully!",
+                                color=0x00ff00  # Green for success
+                            )
 
                             success_embed.add_field(
-                            name="🔷 Team 1",
-                            value=format_team(finalLowestMatchup[0]),
-                            inline=False
-                        )
+                                name="🔷 Team 1",
+                                value=format_team(finalLowestMatchup[0]),
+                                inline=False
+                            )
                             success_embed.add_field(
-                            name="🔴 Team 2",
-                            value=format_team(finalLowestMatchup[1]),
-                            inline=False
-                        )
+                                name="🔴 Team 2",
+                                value=format_team(finalLowestMatchup[1]),
+                                inline=False
+                            )
 
                             try:
-                                notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
+                                notification_channel = client.get_channel(
+                                    int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
                                 if notification_channel:
                                     await notification_channel.send(embed=success_embed)
-                                    return[finalLowestMatchup[0],finalLowestMatchup[1]]
+                                    return [finalLowestMatchup[0], finalLowestMatchup[1]]
                             except Exception as e:
                                 print(f"Couldn't send to notification channel: {e}")
 
-                    else: # A valid team still doesn't exist, relax restrictions again.
+                    else:  # A valid team still doesn't exist, relax restrictions again.
 
                         print('Teams reached level 2 relaxing')
                         for x in range(0, len(team1Configurations)):
@@ -2513,11 +2574,16 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                                 dummyTeam2 = createDummyTeam(masterListTeam2, team2Configurations[y])
 
-                                result1 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[0], dummyTeam2.playerList[0])
-                                result2 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[1], dummyTeam2.playerList[1])
-                                result3 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[2], dummyTeam2.playerList[2])
-                                result4 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[3], dummyTeam2.playerList[3])
-                                result5 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[4], dummyTeam2.playerList[4])
+                                result1 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[0],
+                                                                             dummyTeam2.playerList[0])
+                                result2 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[1],
+                                                                             dummyTeam2.playerList[1])
+                                result3 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[2],
+                                                                             dummyTeam2.playerList[2])
+                                result4 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[3],
+                                                                             dummyTeam2.playerList[3])
+                                result5 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[4],
+                                                                             dummyTeam2.playerList[4])
                                 if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
                                     plausibleTeamCombos.append([team1Configurations[x], team2Configurations[y]])
 
@@ -2530,48 +2596,49 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                             matchupScore = plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
                             if matchupScore < lowestScore:
-
                                 lowestScore = matchupScore
                                 plausibleBackupTeam1.append(plausibleTeam1)
                                 plausibleBackupTeam2.append(plausibleTeam2)
 
-                        if len(plausibleBackupTeam1) != 0: # A valid team exists!
+                        if len(plausibleBackupTeam1) != 0:  # A valid team exists!
 
                             lowestDiff = 1000
                             finalLowestMatchup = []
                             for x in range(len(plausibleBackupTeam1)):
-                                differenceInSkill = abs(plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
+                                differenceInSkill = abs(
+                                    plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
                                 if differenceInSkill < lowestDiff:
                                     finalLowestMatchup = [plausibleBackupTeam1[x], plausibleBackupTeam2[x]]
                                     lowestDiff = differenceInSkill
 
                             if finalLowestMatchup:
                                 success_embed = discord.Embed(
-                                title="✅ Balanced Teams Created",
-                                description="Matchmaking created balanced teams successfully!",
-                                color=0x00ff00  # Green for success
-                            )
+                                    title="✅ Balanced Teams Created",
+                                    description="Matchmaking created balanced teams successfully!",
+                                    color=0x00ff00  # Green for success
+                                )
 
                                 success_embed.add_field(
-                                name="🔷 Team 1",
-                                value=format_team(finalLowestMatchup[0]),
-                                inline=False
-                            )
+                                    name="🔷 Team 1",
+                                    value=format_team(finalLowestMatchup[0]),
+                                    inline=False
+                                )
                                 success_embed.add_field(
-                                name="🔴 Team 2",
-                                value=format_team(finalLowestMatchup[1]),
-                                inline=False
-                            )
+                                    name="🔴 Team 2",
+                                    value=format_team(finalLowestMatchup[1]),
+                                    inline=False
+                                )
 
                                 try:
-                                    notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
+                                    notification_channel = client.get_channel(
+                                        int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
                                     if notification_channel:
                                         await notification_channel.send(embed=success_embed)
-                                        return[finalLowestMatchup[0],finalLowestMatchup[1]]
+                                        return [finalLowestMatchup[0], finalLowestMatchup[1]]
                                 except Exception as e:
                                     print(f"Couldn't send to notification channel: {e}")
 
-                        else: # Still invalid, relax restrictions one final time.
+                        else:  # Still invalid, relax restrictions one final time.
 
                             print('Teams reached level 3 relaxing (final)')
                             for x in range(0, len(team1Configurations)):
@@ -2582,11 +2649,16 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                                     dummyTeam2 = createDummyTeam(masterListTeam2, team2Configurations[y])
 
-                                    result1 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[0], dummyTeam2.playerList[0])
-                                    result2 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[1], dummyTeam2.playerList[1])
-                                    result3 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[2], dummyTeam2.playerList[2])
-                                    result4 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[3], dummyTeam2.playerList[3])
-                                    result5 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[4], dummyTeam2.playerList[4])
+                                    result1 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[0],
+                                                                                 dummyTeam2.playerList[0])
+                                    result2 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[1],
+                                                                                 dummyTeam2.playerList[1])
+                                    result3 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[2],
+                                                                                 dummyTeam2.playerList[2])
+                                    result4 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[3],
+                                                                                 dummyTeam2.playerList[3])
+                                    result5 = isPlayerMatchupValidLowRestrictive(dummyTeam1.playerList[4],
+                                                                                 dummyTeam2.playerList[4])
                                     if result1 == True and result2 == True and result3 == True and result4 == True and result5 == True:
                                         plausibleTeamCombos.append([team1Configurations[x], team2Configurations[y]])
 
@@ -2599,54 +2671,55 @@ async def matchmake(interaction: discord.Interaction, playerList):
 
                                 matchupScore = plausibleTeam1.topLaner.topPreference + plausibleTeam1.jgLaner.jgPreference + plausibleTeam1.midLaner.midPreference + plausibleTeam1.adcLaner.adcPreference + plausibleTeam1.supLaner.supPreference + plausibleTeam2.topLaner.topPreference + plausibleTeam2.jgLaner.jgPreference + plausibleTeam2.midLaner.midPreference + plausibleTeam2.adcLaner.adcPreference + plausibleTeam2.supLaner.supPreference
                                 if matchupScore < lowestScore:
-
                                     lowestScore = matchupScore
                                     plausibleBackupTeam1.append(plausibleTeam1)
                                     plausibleBackupTeam2.append(plausibleTeam2)
 
-                            if len(plausibleBackupTeam1) != 0: # A valid team exists!
+                            if len(plausibleBackupTeam1) != 0:  # A valid team exists!
 
                                 lowestDiff = 1000
                                 finalLowestMatchup = []
                                 for x in range(len(plausibleBackupTeam1)):
-                                    differenceInSkill = abs(plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
+                                    differenceInSkill = abs(
+                                        plausibleBackupTeam1[x].teamTotalQP - plausibleBackupTeam2[x].teamTotalQP)
                                     if differenceInSkill < lowestDiff:
                                         finalLowestMatchup = [plausibleBackupTeam1[x], plausibleBackupTeam2[x]]
                                         lowestDiff = differenceInSkill
 
                                 if finalLowestMatchup:
                                     success_embed = discord.Embed(
-                                    title="✅ Balanced Teams Created",
-                                    description="Matchmaking created balanced teams successfully!",
-                                    color=0x00ff00  # Green for success
-                                )
+                                        title="✅ Balanced Teams Created",
+                                        description="Matchmaking created balanced teams successfully!",
+                                        color=0x00ff00  # Green for success
+                                    )
 
                                     success_embed.add_field(
-                                    name="🔷 Team 1",
-                                    value=format_team(finalLowestMatchup[0]),
-                                    inline=False
-                                )
+                                        name="🔷 Team 1",
+                                        value=format_team(finalLowestMatchup[0]),
+                                        inline=False
+                                    )
                                     success_embed.add_field(
-                                    name="🔴 Team 2",
-                                    value=format_team(finalLowestMatchup[1]),
-                                    inline=False
-                                )
+                                        name="🔴 Team 2",
+                                        value=format_team(finalLowestMatchup[1]),
+                                        inline=False
+                                    )
 
                                     try:
-                                        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
+                                        notification_channel = client.get_channel(
+                                            int(NOTIFICATION_CHANNEL_ID))  # Ensure the correct channel is used
                                         if notification_channel:
                                             await notification_channel.send(embed=success_embed)
-                                            return[finalLowestMatchup[0],finalLowestMatchup[1]]
+                                            return [finalLowestMatchup[0], finalLowestMatchup[1]]
                                     except Exception as e:
                                         print(f"Couldn't send to notification channel: {e}")
 
-                            else: # Nothing has been valid. Either try again or return randomized teams.
+                            else:  # Nothing has been valid. Either try again or return randomized teams.
 
                                 print('We must loop again, sadly.')
                                 if totalOuterLoops > 20:
 
                                     print(
-                            "We have tried many times, but no valid team has been created. A backup pair of teams has been presented.")                          
+                                        "We have tried many times, but no valid team has been created. A backup pair of teams has been presented.")
 
                                     warning_embed = discord.Embed(
                                         title="⚠️ Warning: Potentially Imbalanced Teams",
@@ -2671,12 +2744,13 @@ async def matchmake(interaction: discord.Interaction, playerList):
                                         await notification_channel.send(embed=warning_embed)
                                         return [intermediateTeam1, intermediateTeam2]
                                     except Exception as e:
-                                        print(f"Couldn't send to notification channel: {e}")  
+                                        print(f"Couldn't send to notification channel: {e}")
 
                                 else:
 
                                     continue
-                                               
+
+
 class Tournament:
 
     def __init__(self):
@@ -2823,6 +2897,7 @@ async def rejoin(interaction: discord.Interaction):
             ephemeral=True
         )
 
+
 class winnerButtons(discord.ui.View):
     # timeout after 900 seconds = end of 15-minute volunteer period
     def __init__(self, *, timeout=900):
@@ -2858,7 +2933,8 @@ class winnerButtons(discord.ui.View):
         await interaction.response.edit_message(view=self)
         await interaction.followup.send('Committing to DB', ephemeral=True)
 
-#Command to start check-in
+
+# Command to start check-in
 # Fetch existing Discord IDs from Google Sheets
 def fetch_existing_discord_ids():
     try:
@@ -2869,38 +2945,73 @@ def fetch_existing_discord_ids():
         print(f"Error fetching existing Discord IDs: {e}")
         return set()
 
-
 existing_discord_ids = fetch_existing_discord_ids()
+
 
 @tree.command(
     name='start_tournament',
     description='Initiate tournament creation',
     guild=discord.Object(GUILD))
 async def startTourney(interaction: discord.Interaction):
-    player = interaction.user
-    checkinStart = time.time()
-    checkinFinish = time.time() + CHECKIN_TIME
-    totalMinutes = round(round(CHECKIN_TIME) // 60)
-    totalSeconds = round(round(CHECKIN_TIME) % 60)
+    try:
+        # Defer the response immediately to prevent interaction timeout
+        await interaction.response.defer()
 
-    # Simple message without role selection
-    await interaction.response.send_message(
-        f'A new tournament has been started by {player.mention}!\n'
-        f'Check-in started at <t:{round(checkinStart)}:T>\n\n'
-        'Use `/checkin` to participate!\n'
-        'Use `/rolepreference` to set your role preferences.'
-    )
+        player = interaction.user
+        checkinStart = time.time()
+        checkinFinish = time.time() + CHECKIN_TIME
+        totalMinutes = round(round(CHECKIN_TIME) // 60)
+        totalSeconds = round(round(CHECKIN_TIME) % 60)
 
-    # Send notification to admin channel
-    notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-    if notification_channel:
-        await notification_channel.send(
-            f"🏆 Tournament started by {player.mention}! Check-in open for {totalMinutes} minutes."
+        # Reset all players' "Checked In" status to "No" (column 20)
+        try:
+            existing_records = playerDB.get_all_records()
+            updates = []
+            for i, record in enumerate(existing_records, start=2):  # Start from row 2
+                if i > 1:  # Skip header row
+                    updates.append((i, 20, "No"))  # Column 20 is "Checked In"
+
+            if updates:
+                await batch_sheet_update(playerDB, updates)
+                print("Reset all players' check-in status to 'No'")
+        except Exception as e:
+            print(f"Error resetting check-in status: {e}")
+            await interaction.followup.send(
+                "⚠️ Could not reset check-in status for all players. Continuing with tournament start...",
+                ephemeral=True
+            )
+
+        # Send the tournament start message
+        message = (
+            f'A new tournament has been started by {player.mention}!\n'
+            f'Check-in started at <t:{round(checkinStart)}:T>\n\n'
+            'Use `/checkin` to participate!\n'
+            'Use `/rolepreference` to set your role preferences.'
         )
 
-    newTournament = Tournament()
+        await interaction.followup.send(message)
 
+        # Send notification to admin channel
+        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        if notification_channel:
+            await notification_channel.send(
+                f"🏆 Tournament started by {player.mention}! Check-in open for {totalMinutes} minutes."
+            )
 
+        newTournament = Tournament()
+
+    except Exception as e:
+        print(f"Error in start_tournament command: {e}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ An error occurred while starting the tournament.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "❌ An error occurred while starting the tournament.",
+                ephemeral=True
+            )
 @tree.command(
     name='checkin',
     description='Check in for tournament participation',
@@ -2972,17 +3083,15 @@ async def sitout(interaction: discord.Interaction):
     description='Create a lobby of 10 players after enough have checked in',
     guild=discord.Object(GUILD))
 async def create_game(interaction: discord.Interaction):
-
     def format_team(team, team_name):
-            return (
-                f"**{team_name}**\n"
-                f"Top: {team.topLaner.name}\n"
-                f"Jungle: {team.jgLaner.name}\n"
-                f"Mid: {team.midLaner.name}\n"
-                f"ADC: {team.adcLaner.name}\n"
-                f"Support: {team.supLaner.name}"
-            )
-
+        return (
+            f"**{team_name}**\n"
+            f"Top: {team.topLaner.name}\n"
+            f"Jungle: {team.jgLaner.name}\n"
+            f"Mid: {team.midLaner.name}\n"
+            f"ADC: {team.adcLaner.name}\n"
+            f"Support: {team.supLaner.name}"
+        )
 
     try:
         await interaction.response.defer()
@@ -2999,9 +3108,9 @@ async def create_game(interaction: discord.Interaction):
             )
             return
 
-        else: # Create 1 or more lobbies
-            
-            totalNeededLobbies = len(checked_in_players)//10 # Integer division, divides into fully fillable lobbies
+        else:  # Create 1 or more lobbies
+
+            totalNeededLobbies = len(checked_in_players) // 10  # Integer division, divides into fully fillable lobbies
             # Prepare player data
             players = []
             for player in checked_in_players:
@@ -3012,28 +3121,28 @@ async def create_game(interaction: discord.Interaction):
                 players.append(player.get("Role 3 (Mid)"))
                 players.append(player.get("Role 4 (ADC)"))
                 players.append(player.get("Role 5 (Support)"))
-                
-            intermediateList = formatList(players) # Now we have a list of participant objects.
+
+            intermediateList = formatList(players)  # Now we have a list of participant objects.
             random.shuffle(intermediateList)
-           
+
             # If we only need 1 lobby, we can just leave it randomized for more variety.
             if totalNeededLobbies == 1:
-                
-                finalList = [players]
 
-            else: # If we need more than one lobby, we should sort players, so that higher tier players play against each other
+                finalList = [intermediateList]
+
+            else:  # If we need more than one lobby, we should sort players, so that higher tier players play against each other
 
                 sortedPlayers = (sorted(intermediateList, key=lambda x: x.tier))
 
                 finalList = []
                 num_players = len(sortedPlayers)
-    
+
                 base_size = num_players // totalNeededLobbies
-    
+
                 remainder = num_players % totalNeededLobbies
-    
+
                 start_index = 0
-    
+
                 for i in range(totalNeededLobbies):
 
                     # Each lobby will have at least `base_size` players
@@ -3044,19 +3153,21 @@ async def create_game(interaction: discord.Interaction):
                         end_index = start_index + base_size + 1
                     else:
                         end_index = start_index + base_size
-        
+
                     lobby = sortedPlayers[start_index:end_index]
                     finalList.append(lobby)
-        
+
                     # Step 4.3: Update the starting index of the list for the next lobby
                     start_index = end_index
 
             # Run matchmaking
-            for x in range(0,totalNeededLobbies):  
+            for x in range(0, totalNeededLobbies):
 
                 matchmakingList = finalList[x]
                 bothTeams = await matchmake(interaction, matchmakingList)
 
+                global current_teams
+                current_teams = {"team1": bothTeams[0], "team2": bothTeams[1]}
                 try:
                     save_teams_to_sheet(bothTeams)
                     print("Team successfully saved to database.")
@@ -3067,55 +3178,46 @@ async def create_game(interaction: discord.Interaction):
                 await interaction.followup.send("✅ Game created and saved to database successfully!")
 
                 # Increment participation for all players in the game
-                try:
-                    # Get all player names from both teams
-                    all_players = []
-                    for team in [bothTeams[0], bothTeams[1]]:
-                        all_players.extend([
-                            team.topLaner.name,
-                            team.jgLaner.name,
-                            team.midLaner.name,
-                            team.adcLaner.name,
-                            team.supLaner.name
-                        ])
+            # Increment participation for all players in the game
+            try:
+                all_players = []
+                for team in [bothTeams[0], bothTeams[1]]:
+                    all_players.extend([
+                        team.topLaner.name, team.jgLaner.name, team.midLaner.name,
+                        team.adcLaner.name, team.supLaner.name
+                    ])
 
-                    # Update participation for each player
-                    existing_records = playerDB.get_all_records()
-                    for player_name in all_players:
-                        for i, record in enumerate(existing_records, start=2):  # Start from row 2
-                            if record.get("Players1") == player_name:
-                                # Get current values
-                                current_tier_participation = int(record.get("Participation (Current Tier)", 0))
-                                total_participation = int(record.get("Participation (Total)", 0))
+                existing_records = playerDB.get_all_records()
+                updates = []
+                for player_name in all_players:
+                    for i, record in enumerate(existing_records, start=2):
+                        if record.get("Players1") == player_name:
+                            current_tier_part = int(record.get("Participation (Current Tier)", 0))
+                            total_part = int(record.get("Participation (Total)", 0))
+                            current_games = int(record.get("Games Played (current tier)", 0))
+                            total_games = int(record.get("Games Played (Total)", 0))
+                            wins_current = int(record.get("Wins (Current Tier)", 0))
+                            wins_total = int(record.get("Wins (Total)", 0))
 
-                                # Update both participation columns
-                                playerDB.update_cell(i, 9,
-                                                     current_tier_participation + 1)  # Column 9: Participation (Current Tier)
-                                playerDB.update_cell(i, 10, total_participation + 1)  # Column 10: Participation (Total)
+                            updates.append({
+                                'range': f'I{i}:P{i}',
+                                'values': [[
+                                    current_tier_part + 1, total_part + 1,
+                                    float(wins_current / max(1, current_games + 1)),  # WR % Current
+                                    wins_current, total_games + 1,
+                                    float(wins_total / max(1, total_games + 1)),  # WR % Total
+                                    current_games + 1, total_games + 1
+                                ]]
+                            })
+                            break
 
-                                # Also update Games Played columns (columns 15 and 16)
-                                current_tier_games = int(record.get("Games Played (current tier)", 0))
-                                total_games = int(record.get("Games Played (Total)", 0))
-                                playerDB.update_cell(i, 15, current_tier_games + 1)  # Column 15: Games Played (current tier)
-                                playerDB.update_cell(i, 16, total_games + 1)  # Column 16: Games Played (Total)
-
-                                # Update win rate (column 11 and 12) if needed
-                                wins_current = int(record.get("Wins (Current Tier)", 0))
-                                new_current_games = current_tier_games + 1
-                                current_win_rate = wins_current / new_current_games if new_current_games > 0 else 0
-                                playerDB.update_cell(i, 11, current_win_rate)  # Column 11: WR %
-
-                                wins_total = int(record.get("Wins (Total)", 0))
-                                new_total_games = total_games + 1
-                                win_rate = wins_total / new_total_games if new_total_games > 0 else 0
-                                playerDB.update_cell(i, 11, win_rate)  # Column 11: WR %
-
-                                break
-
+                if updates:
+                    async with sheets_limiter:
+                        playerDB.batch_update(updates)
                     print("Updated participation and games played for all players in the game.")
-                except Exception as e:
-                    print(f"Error updating participation: {e}")
-                         
+            except Exception as e:
+                print(f"Error updating participation: {e}")
+
 
     except Exception as e:
         print(f"Error in create_game: {e}")
@@ -3123,7 +3225,6 @@ async def create_game(interaction: discord.Interaction):
             "An error occurred while creating the game. Check console for details.",
             ephemeral=True
         )
-
 @tree.command(
     name="swap",
     description="Swap two players between teams (Admin only).",
@@ -3133,42 +3234,95 @@ async def create_game(interaction: discord.Interaction):
 async def swap(interaction: discord.Interaction, player1: str, player2: str):
     global current_teams
     try:
-        # Check if teams exist
+        await interaction.response.defer()
+
+        # Normalize input player names
+        player1 = player1.strip().lower()
+        player2 = player2.strip().lower()
+
+        # Load teams from database if not in memory
         if not current_teams.get("team1") or not current_teams.get("team2"):
-            await interaction.response.send_message("❌ No teams found. Make sure matchmaking has run first.",
-                                                    ephemeral=True)
-            return
+            try:
+                all_games = gameDB.get_all_values()
+                latest_game = None
+                for row in reversed(all_games[1:]):  # Skip header row
+                    if len(row) >= 3 and not row[2]:  # No winner yet (Column C)
+                        latest_game = row
+                        break
+
+                if not latest_game:
+                    await interaction.followup.send(
+                        "❌ No active game found. Make sure matchmaking has run and no winner is declared.",
+                        ephemeral=True
+                    )
+                    return
+
+                game_row = all_games.index(latest_game) + 1
+                team1_players = latest_game[4:9]   # Columns E-I
+                team2_players = latest_game[9:14]  # Columns J-N
+
+                def get_player_rank(name):
+                    records = playerDB.get_all_records()
+                    for r in records:
+                        if r.get("Players1") == name:
+                            return r.get("Rank Tier", "UNRANKED")
+                    return "UNRANKED"
+
+                team1 = team([participant(name, get_player_rank(name), 0, 0, 0, 0, 0)
+                             for name in team1_players if name])
+                team2 = team([participant(name, get_player_rank(name), 0, 0, 0, 0, 0)
+                             for name in team2_players if name])
+                current_teams = {"team1": team1, "team2": team2}
+            except Exception as e:
+                print(f"Error recovering teams: {e}")
+                await interaction.followup.send(
+                    "❌ No teams found. Make sure matchmaking has run first.",
+                    ephemeral=True
+                )
+                return
 
         team1 = current_teams["team1"]
         team2 = current_teams["team2"]
 
-        # Find the players in the teams
+        # Debug: Print current team rosters
+        print(f"Team 1 players: {[p.name for p in team1.playerList]}")
+        print(f"Team 2 players: {[p.name for p in team2.playerList]}")
+        print(f"Looking for: player1='{player1}', player2='{player2}'")
+
+        # Find players in teams
         player1_found = None
         player2_found = None
         player1_team = None
         player2_team = None
 
-        # Search both teams for the players
         for player in team1.playerList:
-            if player.name == player1:
+            if player.name.strip().lower() == player1:
                 player1_found = player
                 player1_team = team1
-            elif player.name == player2:
+            elif player.name.strip().lower() == player2:
                 player2_found = player
                 player2_team = team1
 
         for player in team2.playerList:
-            if player.name == player1:
+            if player.name.strip().lower() == player1:
                 player1_found = player
                 player1_team = team2
-            elif player.name == player2:
+            elif player.name.strip().lower() == player2:
                 player2_found = player
                 player2_team = team2
 
-        # If one or both players are not found, send an error message
         if not player1_found or not player2_found:
-            await interaction.response.send_message("❌ One or both players were not found in the teams.",
-                                                    ephemeral=True)
+            missing = []
+            if not player1_found:
+                missing.append(player1)
+            if not player2_found:
+                missing.append(player2)
+            await interaction.followup.send(
+                f"❌ Player(s) not found in teams: {', '.join(missing)}. "
+                f"Team 1: {[p.name for p in team1.playerList]}, "
+                f"Team 2: {[p.name for p in team2.playerList]}",
+                ephemeral=True
+            )
             return
 
         # Perform the swap
@@ -3183,77 +3337,92 @@ async def swap(interaction: discord.Interaction, player1: str, player2: str):
             team2.playerList.append(player2_found)
             team1.playerList.append(player1_found)
         else:
-            # If players are on the same team, swap their roles instead
+            # Same team swap (role swap)
             swapPlayerRolesSameTeam(player1_team, player1_found, player2_found)
 
-        # Update team QP
+        # Update team stats
         team1.updateTeamQP()
         team2.updateTeamQP()
+        team1.reinstateIdealizedRoles()
+        team2.reinstateIdealizedRoles()
 
-        # Update the global teams
+        # Update current_teams
         current_teams["team1"] = team1
         current_teams["team2"] = team2
 
-        # Get current game ID from GameDatabase
+        # Update database
         latest_game_id = gameDB.col_values(1)[-1]
         if not latest_game_id.isnumeric():
-            await interaction.response.send_message("❌ Could not determine current game ID.", ephemeral=True)
+            await interaction.followup.send(
+                "❌ Could not determine current game ID.",
+                ephemeral=True
+            )
             return
-        game_row = int(latest_game_id) + 1  # +1 because row 1 is headers
+        game_row = int(latest_game_id) + 1
 
-        # Update GameDatabase
-        gameDB.batch_update([{
-            'range': f'E{game_row}:N{game_row}',
-            'values': [[
-                team1.topLaner.name, team1.jgLaner.name, team1.midLaner.name,
-                team1.adcLaner.name, team1.supLaner.name,
-                team2.topLaner.name, team2.jgLaner.name, team2.midLaner.name,
-                team2.adcLaner.name, team2.supLaner.name
-            ]]
-        }])
+        async with sheets_limiter:
+            gameDB.batch_update([{
+                'range': f'E{game_row}:N{game_row}',
+                'values': [[
+                    team1.topLaner.name, team1.jgLaner.name, team1.midLaner.name,
+                    team1.adcLaner.name, team1.supLaner.name,
+                    team2.topLaner.name, team2.jgLaner.name, team2.midLaner.name,
+                    team2.adcLaner.name, team2.supLaner.name
+                ]]
+            }])
 
-        # Format updated team info to match desired output
-        team1_info = (
-            f"**\n"
-            f"Top: {team1.topLaner.name}\n"
-            f"Jungle: {team1.jgLaner.name}\n"
-            f"Mid: {team1.midLaner.name}\n"
-            f"ADC: {team1.adcLaner.name}\n"
-            f"Support: {team1.supLaner.name}"
-        )
-        team2_info = (
-            f"**\n"
-            f"Top: {team2.topLaner.name}\n"
-            f"Jungle: {team2.jgLaner.name}\n"
-            f"Mid: {team2.midLaner.name}\n"
-            f"ADC: {team2.adcLaner.name}\n"
-            f"Support: {team2.supLaner.name}"
-        )
-
-        # Create embed with updated teams
+        # Create embed for response
         embed = discord.Embed(
-            title="Game Lobby Created",
+            title="Game Lobby Updated",
             description=f"Swapped **{player1}** and **{player2}** between teams!",
             color=0x00ff00
         )
-        embed.add_field(name="Team 1", value=team1_info, inline=False)
-        embed.add_field(name="Team 2", value=team2_info, inline=False)
+        embed.add_field(
+            name="Team 1",
+            value=(
+                f"Top: {team1.topLaner.name}\n"
+                f"Jungle: {team1.jgLaner.name}\n"
+                f"Mid: {team1.midLaner.name}\n"
+                f"ADC: {team1.adcLaner.name}\n"
+                f"Support: {team1.supLaner.name}"
+            ),
+            inline=False
+        )
+        embed.add_field(
+            name="Team 2",
+            value=(
+                f"Top: {team2.topLaner.name}\n"
+                f"Jungle: {team2.jgLaner.name}\n"
+                f"Mid: {team2.midLaner.name}\n"
+                f"ADC: {team2.adcLaner.name}\n"
+                f"Support: {team2.supLaner.name}"
+            ),
+            inline=False
+        )
 
-        # Send to notification channel
+        # Send notification
         notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-        await notification_channel.send(embed=embed)
+        if notification_channel:
+            await notification_channel.send(embed=embed)
 
-        # Send to the current channel (where command was executed) using followup
-        await interaction.response.send_message(embed=embed)
         await interaction.followup.send(
-            f"✅ Swapped **{player1}** and **{player2}** between teams!",
+            embed=embed,
+            content=f"✅ Swapped **{player1}** and **{player2}** between teams!",
             ephemeral=False
         )
 
     except Exception as e:
         print(f"Error swapping players: {e}")
-        await interaction.response.send_message(f"❌ Error swapping players: {e}", ephemeral=True)
-
+        if "Quota exceeded" in str(e):
+            await interaction.followup.send(
+                "❌ Failed to update teams due to Google Sheets API quota limit. Please wait a minute and retry.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ Error swapping players: {e}",
+                ephemeral=True
+            )
 
 @tree.command(
     name="toxicity",
@@ -3382,6 +3551,7 @@ async def view_toxicity(interaction: discord.Interaction, player_name: str):
             ephemeral=True
         )
 
+
 @tree.command(
     name="uncheckin",
     description="Remove yourself from the tournament",
@@ -3421,18 +3591,42 @@ async def uncheckin(interaction: discord.Interaction):
             ephemeral=True
         )
 
-
 @tree.command(
     name="show_teams",
-    description="Show current teams")
+    description="Show current teams",
+    guild=discord.Object(GUILD)
+)
 async def show_teams(interaction: discord.Interaction):
-    if current_teams["team1"] is None:
+    global current_teams
+    if not current_teams.get("team1") or not current_teams.get("team2"):
         await interaction.response.send_message("No teams created yet!", ephemeral=True)
         return
 
-    embed = discord.Embed(title="Current Teams")
-    # Add team info to embed
-    await interaction.response.send_message(embed=embed)
+    embed = discord.Embed(title="Current Teams", color=0x00ff00)
+    embed.add_field(
+        name="Team 1",
+        value=(
+            f"Top: {current_teams['team1'].topLaner.name}\n"
+            f"Jungle: {current_teams['team1'].jgLaner.name}\n"
+            f"Mid: {current_teams['team1'].midLaner.name}\n"
+            f"ADC: {current_teams['team1'].adcLaner.name}\n"
+            f"Support: {current_teams['team1'].supLaner.name}"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Team 2",
+        value=(
+            f"Top: {current_teams['team2'].topLaner.name}\n"
+            f"Jungle: {current_teams['team2'].jgLaner.name}\n"
+            f"Mid: {current_teams['team2'].midLaner.name}\n"
+            f"ADC: {current_teams['team2'].adcLaner.name}\n"
+            f"Support: {current_teams['team2'].supLaner.name}"
+        ),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
 
 async def help_command(interaction: discord.Interaction):
     pages = [
@@ -3563,6 +3757,7 @@ async def on_disconnect():
     if session:
         await session.close()  # Ensure session is closed when bot disconnects
         print("Closed aiohttp session.")
+
 
 
 # Entry point to run async setup before bot starts
