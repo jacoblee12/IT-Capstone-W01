@@ -75,11 +75,32 @@ To integrate Google Sheets with the bot, you must first create a Google Cloud Pr
   - Move the downloaded JSON file to a secure location on your system.
   - Update the path in Bot2.py (line ~113) to reference the exact location of your JSON file (e.g., C:/path/to/your/gspread_service_account.json).
 
+Riot API
+1. Sign Up on Riot Developer Portal:
+  -Visit Riot Developer Portal at https://developer.riotgames.com/
+  -Log in using your Riot account credentials.
+2. Agree to the Terms:
+  -You must agree to Riot’s API Terms of Use before you can create an API key.
+3.Create an Application:
+  -Once logged in, navigate to your developer dashboard.
+  -Create a new application (sometimes called a project)
+4. Receive Your API Key:
+  -After creating your application, Riot will provide you with an API key that you can use immediately for development and testing purposes.
+   
+API Key Lifespan and Usage
+Development API Key:
+-The default API key you obtain for development is typically valid for 24 hours
+-Sometimes the portal may automatically refresh the key. However, you must be prepared to generate a new key once the 24‑hour period expires if you continue testing. (to get a more permanent key see Production API Key)
+
+Production API Key:
+-If you plan to deploy your application publicly or need higher rate limits, you’ll need to submit your application for review to obtain a production key.
+-Production keys generally have longer validity, though you must adhere to Riot’s guidelines and rate limits to maintain it.
+
 .env Configuration Options
 Edit the `.env` file with these variables in a plain text document or in an IDE (i.e Visual Studio code):
 - **`BOT_TOKEN`**: Your Discord bot token from the Developer Portal (Bot tab> Reset Token>copy the token).
 - **`GUILD_TOKEN`**: The ID of your Discord server (right-click Discord server > Copy ID).
-- **`RIOT_API_KEY`**: Your Riot Games API key (get from https://developer.riotgames.com/).
+- **`RIOT_API_KEY`**: Your Riot Games API key (See Riot API section).
 - **`GSHEETS_API`**: Google Sheets API key (see Google Sheets integration).
 - **`GSHEETS_ID`**: Google Spreadsheet ID for the main workbook(after "/d/" and before "/edit" in the url).
 - **`GHSEETS_GAMEDB`**: Worksheet name for game data (default: `GameDatabase`).
