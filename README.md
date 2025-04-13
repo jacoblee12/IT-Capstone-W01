@@ -91,12 +91,14 @@ Riot API Key Steps
    After creating your application, Riot will provide you with an API key that you can use immediately for development and testing purposes.
     
 API Key Lifespan and Usage
-**Development API Key:
+**Development API Key
+
   -The default API key you obtain for development is typically valid for 24 hours
   -Sometimes the portal may automatically refresh the key. However, you must be prepared to generate a new key once the 24‑hour period expires if you continue     testing. (to get a more permanent key see Production API Key)
 
 
 **Production API Key:
+
   -If you plan to deploy your application publicly or need higher rate limits, you’ll need to submit your application for review to obtain a production key.
   -Production keys generally have longer validity, though you must adhere to Riot’s guidelines and rate limits to maintain it.
 
