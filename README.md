@@ -79,20 +79,25 @@ Riot API
 1. Sign Up on Riot Developer Portal:
   -Visit Riot Developer Portal at https://developer.riotgames.com/
   -Log in using your Riot account credentials.
-2. Agree to the Terms:
+   
+3. Agree to the Terms:
   -You must agree to Riot’s API Terms of Use before you can create an API key.
+   
 3.Create an Application:
   -Once logged in, navigate to your developer dashboard.
   -Create a new application (sometimes called a project)
-4. Receive Your API Key:
+  
+5. Receive Your API Key:
   -After creating your application, Riot will provide you with an API key that you can use immediately for development and testing purposes.
    
 API Key Lifespan and Usage
 Development API Key:
+
 -The default API key you obtain for development is typically valid for 24 hours
 -Sometimes the portal may automatically refresh the key. However, you must be prepared to generate a new key once the 24‑hour period expires if you continue testing. (to get a more permanent key see Production API Key)
 
 Production API Key:
+
 -If you plan to deploy your application publicly or need higher rate limits, you’ll need to submit your application for review to obtain a production key.
 -Production keys generally have longer validity, though you must adhere to Riot’s guidelines and rate limits to maintain it.
 
