@@ -136,7 +136,7 @@ session = None
 
 # Set up gspread for access by functions
 
-gc = gspread.service_account(filename='C:\\Users\\trist\\Downloads\\testing the install\\gspread_service_account.json')
+gc = gspread.service_account(filename='C:\\Users\\Jacob\\source\\repos\\KSU Capstone Project\\KSU Capstone Project\\gspread_service_account.json')
 googleWorkbook = gc.open_by_key(GSHEETS_ID)
 
 tourneyDB = googleWorkbook.worksheet('TournamentDatabase')
@@ -332,12 +332,15 @@ async def safe_api_call(url, headers):
     print("All attempts to connect to the Riot API have failed.")
     return None
 
+# Global variable to track who has voted per lobby
+voted_players = defaultdict(set)
 
 class MVPView(discord.ui.View):
 
     def __init__(self, lobby_id, winning_team_players):
         super().__init__(timeout=180)  # 3-minute timeout
         self.lobby_id = lobby_id
+        self.winning_team_players = winning_team_players  # Store for validation
         self.add_item(MVPDropdown(winning_team_players, lobby_id))
 
 
@@ -359,15 +362,52 @@ class MVPDropdown(discord.ui.Select):
         selected_mvp = self.values[0]
         voter_id = f"{interaction.user.name}#{interaction.user.discriminator}"
 
+       # Use Discord ID for voter_id to ensure uniqueness and consistency
+        voter_id = str(interaction.user.id)
+
+        # Map Discord ID to player name from PlayerDatabase
+        existing_records = playerDB.get_all_records()
+        voter_name = None
+        for record in existing_records:
+            if record.get("Discord ID") == f"{interaction.user.name}#{interaction.user.discriminator}":
+                voter_name = record.get("Players1")
+                break
+
+        if not voter_name:
+            await interaction.response.send_message(
+                "❌ You must link your Riot ID with `/link` to vote for MVP!",
+                ephemeral=True
+            )
+            return
+
+        # Check if voter is from the winning team
+        winning_team_names = {player.name.lower() for player in self.winning_team_players}
+        if voter_name.lower() not in winning_team_names:
+            await interaction.response.send_message(
+                f"❌ Only players from the winning team can vote for MVP! (Voter: {voter_name})",
+                ephemeral=True
+            )
+            return
+
         # Prevent self-voting
-        if voter_id == selected_mvp:
+        if voter_name.lower() == selected_mvp.lower():
             await interaction.response.send_message(
                 "❌ You cannot vote for yourself!",
                 ephemeral=True
             )
             return
 
-        # Update vote count
+        # Check if player has already voted
+        if voter_id in voted_players[self.lobby_id]:
+            await interaction.response.send_message(
+                "❌ You have already voted for this game’s MVP!",
+                ephemeral=True
+            )
+            return
+
+        # Record the vote
+        voted_players[self.lobby_id].add(voter_id)
+        print(f"Recorded vote from {voter_name} (ID: {voter_id}) for {selected_mvp} in lobby {self.lobby_id}")
         mvp_votes[self.lobby_id][selected_mvp] += 1
         current_votes = mvp_votes[self.lobby_id][selected_mvp]
 
@@ -378,21 +418,24 @@ class MVPDropdown(discord.ui.Select):
                 f"🎉 {selected_mvp} has reached {MVP_VOTE_THRESHOLD} votes and is the MVP!",
                 ephemeral=False
             )
-
-            # Update database with MVP
             try:
                 game_row = int(self.lobby_id) + 1
-                gameDB.update_cell(f'D{game_row}', selected_mvp)  # Update MVP in database
-
-                # Update player's MVP count
+                async with sheets_limiter:
+                    gameDB.update_cell(game_row, 4, selected_mvp)  # Column D (4) is MVP
                 existing_records = playerDB.get_all_records()
                 for i, record in enumerate(existing_records, start=2):
                     if record.get("Players1") == selected_mvp:
                         current_mvps = int(record.get("MVPs", 0))
-                        playerDB.update_cell(i, 11, current_mvps + 1)  # Column K (11) is "MVPs"
+                        async with sheets_limiter:
+                            playerDB.update_cell(i, 13, current_mvps + 1)  # Column M (13) is MVPs
                         break
+                # Clear voted_players after MVP is declared
+                voted_players[self.lobby_id].clear()
             except Exception as e:
                 print(f"Error updating MVP in database: {e}")
+                await interaction.channel.send(
+                    f"❌ Failed to save MVP to database: {str(e)}"
+                )
         else:
             await interaction.response.send_message(
                 f"✅ You voted for {selected_mvp} (Total votes: {current_votes}/{MVP_VOTE_THRESHOLD})",
@@ -402,14 +445,13 @@ class MVPDropdown(discord.ui.Select):
 
 @tree.command(
     name="mvp",
-    description="Vote for the MVP from the winning team",
+    description="Vote for the MVP from the winning team (winning team only)",
     guild=discord.Object(GUILD)
 )
 async def mvp(interaction: discord.Interaction):
     try:
         lobby_id = gameDB.col_values(1)[-1]  # Get latest game ID
 
-        # Check if MVP already declared
         if lobby_id in mvp_winners:
             await interaction.response.send_message(
                 f"❌ MVP has already been awarded to {mvp_winners[lobby_id]}",
@@ -417,7 +459,6 @@ async def mvp(interaction: discord.Interaction):
             )
             return
 
-        # Check if game has a winner
         if lobby_id not in game_winners:
             await interaction.response.send_message(
                 "❌ No winner has been declared for this game yet",
@@ -425,7 +466,14 @@ async def mvp(interaction: discord.Interaction):
             )
             return
 
-        # Create voting view
+        # Check if voting is already active
+        if mvp_votes[lobby_id]:
+            await interaction.response.send_message(
+                "❌ MVP voting is already in progress for this game!",
+                ephemeral=True
+            )
+            return
+
         winning_team = game_winners[lobby_id]
         view = MVPView(lobby_id, winning_team.playerList)
         await interaction.response.send_message(
@@ -440,8 +488,6 @@ async def mvp(interaction: discord.Interaction):
             "❌ Failed to start MVP voting",
             ephemeral=True
         )
-
-
 @tree.command(
     name="gamewinner",
     description="Declare the winning team for the current game (Admin only).",
@@ -456,7 +502,6 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
 
         # 1. Validate and load game data
         try:
-            # Get all games and find the most recent unfinished game
             all_games = gameDB.get_all_values()
             if len(all_games) < 2:  # Header + at least one game
                 raise ValueError("No games found in database")
@@ -471,13 +516,11 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
                 raise ValueError("No active games found (all have winners)")
 
             lobby_id = latest_game[0]
-            game_row = all_games.index(latest_game) + 1  # Convert to 1-based index
+            game_row = all_games.index(latest_game) + 1
 
-            # Reconstruct teams from database
             team1_players = latest_game[4:9]  # Columns E-I
             team2_players = latest_game[9:14]  # Columns J-N
 
-            # Get actual player ranks from database
             def get_player_rank(name):
                 records = playerDB.get_all_records()
                 for r in records:
@@ -531,15 +574,25 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
         for i, record in enumerate(existing_records, start=2):
             if record["Players1"] in [p.name for p in all_players]:
                 is_winner = record["Players1"] in [p.name for p in winning_players]
-                games = int(record.get("Games Played", 0)) + 1
-                wins = int(record.get("Wins", 0)) + (1 if is_winner else 0)
+                current_games = int(record.get("Games Played (Current Tier)", 0))
+                total_games = int(record.get("Games Played (Total)", 0))
+                current_wins = int(record.get("Wins (Current Tier)", 0))
+                total_wins = int(record.get("Wins (Total)", 0))
+
+                new_current_games = current_games + 1
+                new_total_games = total_games + 1
+                new_current_wins = current_wins + (1 if is_winner else 0)
+                new_total_wins = total_wins + (1 if is_winner else 0)
 
                 player_updates.extend([
-                    (i, 9, int(record.get("Current Participation", 0)) + 1),
-                    (i, 10, int(record.get("Total Participation", 0)) + 1),
-                    (i, 14, games),
-                    (i, 11, wins),
-                    (i, 15, round(wins / max(1, games), 2))
+                    (i, 9, int(record.get("Participation (Current Tier)", 0)) + 1),  # I
+                    (i, 10, int(record.get("Participation (Total)", 0)) + 1),       # J
+                    (i, 11, new_current_wins),                                      # K: Wins (Current Tier)
+                    (i, 12, new_total_wins),                                        # L: Wins (Total)
+                    (i, 15, new_current_games),                                     # O: Games Played (Current Tier)
+                    (i, 16, new_total_games),                                       # P: Games Played (Total)
+                    (i, 17, round(new_current_wins / max(1, new_current_games), 2)), # Q: WR % (Current Tier)
+                    (i, 18, round(new_total_wins / max(1, new_total_games), 2))     # R: WR % (Total)
                 ])
 
         if player_updates:
@@ -590,8 +643,6 @@ async def gamewinner(interaction: discord.Interaction, winning_team: str):
             "❌ An unexpected error occurred. Check console for details.",
             ephemeral=True
         )
-
-
 async def execute_with_retry(func, *args, max_retries=3, delay=5, **kwargs):
     for attempt in range(max_retries):
         try:
@@ -616,11 +667,9 @@ async def mvpresult(interaction: discord.Interaction):
     try:
         await interaction.response.defer()
 
-        # Get current game info
         lobby_id = gameDB.col_values(1)[-1]
         game_row = int(lobby_id) + 1
 
-        # Check if MVP was already automatically declared
         if lobby_id in mvp_winners:
             mvp_name = mvp_winners[lobby_id]
             await interaction.followup.send(
@@ -629,7 +678,6 @@ async def mvpresult(interaction: discord.Interaction):
             )
             return
 
-        # Check if there are votes
         if lobby_id not in mvp_votes or not mvp_votes[lobby_id]:
             await interaction.followup.send(
                 "❌ No MVP votes have been cast for this game.",
@@ -637,16 +685,12 @@ async def mvpresult(interaction: discord.Interaction):
             )
             return
 
-        # Find player(s) with most votes
         vote_counts = mvp_votes[lobby_id]
         max_votes = max(vote_counts.values())
         mvps = [p for p, v in vote_counts.items() if v == max_votes]
 
-        # Check threshold
         if max_votes < MVP_VOTE_THRESHOLD:
-            # Admin override option
             view = discord.ui.View()
-
             async def declare_mvp_callback(interaction: discord.Interaction):
                 selected_mvp = mvps[0] if mvps else "Unknown"
                 await declare_mvp(lobby_id, game_row, selected_mvp, max_votes, True)
@@ -654,8 +698,6 @@ async def mvpresult(interaction: discord.Interaction):
                     f"✅ Admin override: {selected_mvp} declared MVP with {max_votes} votes",
                     ephemeral=True
                 )
-
-            # Only add button if there's at least one candidate
             if mvps:
                 declare_button = discord.ui.Button(
                     label=f"Declare MVP Anyway (Top: {mvps[0]} with {max_votes} votes)",
@@ -672,9 +714,11 @@ async def mvpresult(interaction: discord.Interaction):
             )
             return
 
-        # If we get here, threshold was reached
-        mvp_name = mvps[0]  # Take the first one if multiple have same votes
+        mvp_name = mvps[0]
         await declare_mvp(lobby_id, game_row, mvp_name, max_votes, False)
+        # Clear voted_players for this lobby after MVP is declared
+        if lobby_id in voted_players:
+            voted_players[lobby_id].clear()
 
     except Exception as e:
         print(f"Error in mvpresult: {e}")
@@ -683,22 +727,32 @@ async def mvpresult(interaction: discord.Interaction):
             ephemeral=True
         )
 
-
 async def declare_mvp(lobby_id, game_row, mvp_name, vote_count, is_override=False):
     """Helper function to declare MVP and update databases"""
     global mvp_winners
-
     try:
         # Update GameDatabase - MVP column (D)
-        gameDB.update_cell(game_row, 4, mvp_name)  # Column D is index 4
+        async with sheets_limiter:
+            gameDB.update_cell(game_row, 4, mvp_name)  # Column D is index 4
 
         # Update PlayerDatabase - increment MVP count
         existing_records = playerDB.get_all_records()
-        for i, record in enumerate(existing_records, start=2):  # Start from row 2
+        mvp_updated = False
+        for i, record in enumerate(existing_records, start=2):
             if record.get("Players1") == mvp_name:
                 current_mvps = int(record.get("MVPs", 0))
-                playerDB.update_cell(i, 15, current_mvps + 1)  # Column K is index 11
+                async with sheets_limiter:
+                    playerDB.update_cell(i, 13, current_mvps + 1)  # Column M (13) is MVPs
+                mvp_updated = True
                 break
+
+        if not mvp_updated:
+            print(f"Player {mvp_name} not found in PlayerDatabase")
+            notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+            if notification_channel:
+                await notification_channel.send(
+                    f"⚠️ Failed to update MVP stats for {mvp_name} in PlayerDatabase (player not found)"
+                )
 
         # Mark as declared
         mvp_winners[lobby_id] = mvp_name
@@ -719,13 +773,19 @@ async def declare_mvp(lobby_id, game_row, mvp_name, vote_count, is_override=Fals
         current_teams["team2"] = None
         if lobby_id in mvp_votes:
             mvp_votes[lobby_id].clear()
+        if lobby_id in voted_players:
+            voted_players[lobby_id].clear()
 
         return True
 
     except Exception as e:
         print(f"Error updating MVP in database: {e}")
+        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        if notification_channel:
+            await notification_channel.send(
+                f"❌ Error updating MVP for {mvp_name}: {str(e)}"
+            )
         return False
-
 
 class MVPDropdown(discord.ui.Select):
     def __init__(self, winning_team_players, lobby_id):
@@ -820,6 +880,7 @@ async def link(interaction: discord.Interaction, riot_id: str):
                     # Fetch existing records from Google Sheets
                     existing_records = playerDB.get_all_records()
                     discord_id = str(member.id)
+                    
                     row_index = None
 
                     # Search for the player in the database using the friendly Discord ID
@@ -831,27 +892,52 @@ async def link(interaction: discord.Interaction, riot_id: str):
                     if row_index:
                         # Player already exists in the database, update their Riot ID and rank
                         playerDB.update_cell(row_index, 2, friendly_discord_id)  # Update friendly Discord ID
-                        playerDB.update_cell(row_index, 3, rank)  # Update Rank Tier
-
-                        # Check if player is unranked and notify admin
-                        if rank.lower() == "unranked":
-                            admin_mention = get_admin_mention(interaction.guild)
-                            notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-                            await notification_channel.send(
-                                f"{admin_mention} - Player {member.mention} ({riot_id}) has linked their account but is UNRANKED!"
-                            )
 
                         await interaction.followup.send(
-                            f"Your Riot ID '{riot_id}' has been updated, and your rank has been updated to {rank}.",
+                            f"Your Riot ID '{riot_id}' has been updated!",
                             ephemeral=True,
                         )
                     else:
+
+                        tier = ""
+                        if rank.lower() in ["challenger","grandmaster"]:
+
+                            tier = 1
+
+                        elif rank.lower() in ["master","diamond"]:
+
+                            tier = 2
+
+                        elif rank.lower() in ["emerald"]:
+
+                            tier = 3
+
+                        elif rank.lower() in ["platinum"]:
+
+                            tier = 4
+
+                        elif rank.lower() in ["gold"]:
+
+                            tier = 5
+
+                        elif rank.lower() in ["silver"]:
+
+                            tier = 6
+
+                        elif rank.lower() in ["bronze","iron"]:
+
+                            tier = 7
+                            
+                        else:
+
+                            tier = "unranked"
+
                         # Player does not exist in the database, create a new row
                         new_row = [
                             member.display_name,  # Player Name
                             friendly_discord_id,  # Friendly Discord ID
-                            rank,  # Rank Tier
-                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,  # Default stats
+                            tier,  # Rank Tier
+                            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "No", "No"  # Default stats
                         ]
                         playerDB.append_row(new_row)
 
@@ -1514,7 +1600,14 @@ class participant():
                  supPreference):
         self.name = playerName
         self.tier = playerTier
-        self.baseQualityPoints = int(TIER_VALUES[str(self.tier)]) + random.uniform(-randomness, randomness)
+
+        if self.tier not in [1,2,3,4,5,6,7]:
+
+            self.baseQualityPoints = 75 # Default value
+        else:
+
+            self.baseQualityPoints = int(TIER_VALUES[str(self.tier)]) + random.uniform(-randomness, randomness)
+
         self.topPreference = topPreference
         self.topQP = self.baseQualityPoints + random.uniform(-randomness, randomness)
         self.jgPreference = jgPreference
@@ -2318,8 +2411,6 @@ async def matchmake(interaction: discord.Interaction, playerList):
     totalOuterLoops = 0
     while keepLooping == True:
 
-        print("This is the total loopage")
-        print(totalOuterLoops)
         totalOuterLoops += 1
 
         random.shuffle(playerList)
@@ -2772,168 +2863,6 @@ class Tournament:
         tourneyDB.update_acell('B' + str(currentTourneyID + 1),
                                '=COUNTIF(GameDatabase!B:B,"="&A' + str(currentTourneyID + 1) + ')')
 
-
-# Check-in button class for checking in to tournaments.
-class CheckinButtons(discord.ui.View):
-    # timeout after 900 seconds = end of 15-minute check-in period
-    def __init__(self, *, timeout=900):
-        super().__init__(timeout=timeout)
-
-    """
-    This button is a green button that is called check in
-    When this button is pulled up, it will show the text "Check-In"
-
-    The following output when clicking the button is to be expected:
-    If the user already has the player role, it means that they are already checked in.
-    If the user doesn't have the player role, it will give them the player role. 
-    """
-
-    @discord.ui.button(
-        label="Check-In",
-        style=discord.ButtonStyle.green)
-    async def checkin(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        player = get(interaction.guild.roles, name='Player')
-        member = interaction.user
-
-        if player in member.roles:
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send('You have already checked in.', ephemeral=True)
-            return "Is already checked in"
-        await member.add_roles(player)
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send('You have checked in!', ephemeral=True)
-        return "Checked in"
-
-    """
-    This button is the leave button. It is used for if the player checked in but has to leave
-    The following output is to be expected:
-
-    If the user has the player role, it will remove it and tell the player that it has been removed
-    If the user does not have the player role, it will tell them to check in first.
-    """
-
-    @discord.ui.button(
-        label="Leave",
-        style=discord.ButtonStyle.red,
-        custom_id='experimentingHere')
-    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-
-        player = get(interaction.guild.roles, name='Player')
-        member = interaction.user
-
-        if player in member.roles:
-            await member.remove_roles(player)
-            await interaction.response.edit_message(view=self)
-            await interaction.followup.send('Sorry to see you go.', ephemeral=True)
-            return "Role Removed"
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send('You have not checked in. Please checkin first', ephemeral=True)
-        return "Did not check in yet"
-
-
-class volunteerButtons(discord.ui.View):
-    # timeout after 900 seconds = end of 15-minute volunteer period
-    def __init__(self, *, timeout=900):
-        super().__init__(timeout=timeout)
-
-    """
-    This button is a green button that is called check in
-    When this button is pulled up, it will show the text "Volunteer"
-
-    The following output when clicking the button is to be expected:
-    If the user already has the volunteer role, it means that they are already volunteered.
-    If the user doesn't have the volunteer role, it will give them the volunteer role. 
-    """
-
-    """
-    This button is the leave button. It is used for if the player who has volunteer wants to rejoin
-    The following output is to be expected:
-
-    If the user has the player role, it will remove it and tell the player that it has been removed
-    If the user does not have the volunteer role, it will tell them to volunteer first.
-    """
-
-
-@tree.command(
-    name="rejoin",
-    description="Rejoin the tournament after volunteering to sit out",
-    guild=discord.Object(GUILD)
-)
-async def rejoin(interaction: discord.Interaction):
-    member = interaction.user
-    player_role = discord.utils.get(interaction.guild.roles, name='Player')
-    volunteer_role = discord.utils.get(interaction.guild.roles, name='Volunteer')
-
-    # Check if user is actually a volunteer
-    if volunteer_role not in member.roles:
-        await interaction.response.send_message(
-            "❌ You're not currently volunteering to sit out!",
-            ephemeral=True
-        )
-        return
-
-    try:
-        # Remove Volunteer role and add Player role
-        await member.remove_roles(volunteer_role)
-        await member.add_roles(player_role)
-
-        await interaction.response.send_message(
-            "✅ You've rejoined the tournament and may be selected for matches!",
-            ephemeral=True
-        )
-
-        # Send notification to admin channel
-        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-        if notification_channel:
-            await notification_channel.send(
-                f"🎉 {member.mention} has rejoined the tournament after sitting out!"
-            )
-
-    except Exception as e:
-        print(f"Error in rejoin command: {e}")
-        await interaction.response.send_message(
-            "❌ An error occurred while processing your request. Please try again.",
-            ephemeral=True
-        )
-
-
-class winnerButtons(discord.ui.View):
-    # timeout after 900 seconds = end of 15-minute volunteer period
-    def __init__(self, *, timeout=900):
-        super().__init__(timeout=timeout)
-
-    winnerVariable = "None Entered"
-
-    @discord.ui.button(
-        label="Blue Team",
-        style=discord.ButtonStyle.blurple)
-    async def winnerBlue(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.user
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send('You have selected the Blue team as the winner!', ephemeral=True)
-        winnerVariable = "Blue"
-        return "Blue"
-
-    @discord.ui.button(
-        label="Red Team",
-        style=discord.ButtonStyle.red)
-    async def winnerRed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.user
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send('You have selected the Red team as the winner!', ephemeral=True)
-        winnerVariable = "Red"
-        return "Red"
-
-    @discord.ui.button(
-        label="Confirm",
-        style=discord.ButtonStyle.grey)
-    async def commitToDB(self, interaction: discord.Interaction, button: discord.ui.Button):
-        member = interaction.user
-        await interaction.response.edit_message(view=self)
-        await interaction.followup.send('Committing to DB', ephemeral=True)
-
-
 # Command to start check-in
 # Fetch existing Discord IDs from Google Sheets
 def fetch_existing_discord_ids():
@@ -2963,13 +2892,14 @@ async def startTourney(interaction: discord.Interaction):
         totalMinutes = round(round(CHECKIN_TIME) // 60)
         totalSeconds = round(round(CHECKIN_TIME) % 60)
 
-        # Reset all players' "Checked In" status to "No" (column 20)
+        # Reset all players' "Checked In" and "Sitout Volunteer" status to "No" (columns 20 and 21)
         try:
             existing_records = playerDB.get_all_records()
             updates = []
             for i, record in enumerate(existing_records, start=2):  # Start from row 2
                 if i > 1:  # Skip header row
                     updates.append((i, 20, "No"))  # Column 20 is "Checked In"
+                    updates.append((i, 21, "No"))  # Column 21 is "Sitout Volunteer"
 
             if updates:
                 await batch_sheet_update(playerDB, updates)
@@ -3012,6 +2942,7 @@ async def startTourney(interaction: discord.Interaction):
                 "❌ An error occurred while starting the tournament.",
                 ephemeral=True
             )
+
 @tree.command(
     name='checkin',
     description='Check in for tournament participation',
@@ -3019,69 +2950,47 @@ async def startTourney(interaction: discord.Interaction):
 )
 async def checkin(interaction: discord.Interaction):
     member = interaction.user
-
-    # Check if user is already checked in
     player_role = discord.utils.get(interaction.guild.roles, name='Player')
-    if player_role in member.roles:
-        await interaction.response.send_message("❌ You're already checked in!", ephemeral=True)
-        return
-
-    # Check if user has linked their account
     friendly_discord_id = await get_friendly_discord_id(member.id, interaction.guild)
     existing_records = playerDB.get_all_records()
-    is_linked = any(record.get("Discord ID") == friendly_discord_id for record in existing_records)
 
-    if not is_linked:
+    if not any(record.get("Discord ID") == friendly_discord_id for record in existing_records):
         await interaction.response.send_message(
             "❌ You must link your Riot ID with `/link` before checking in!",
             ephemeral=True
         )
         return
 
-    # Add Player role
-    try:
-        await member.add_roles(player_role)
-        await interaction.response.send_message(
-            "✅ You've successfully checked in for the tournament!",
-            ephemeral=True
-        )
+    await member.add_roles(player_role)
 
-        # Send notification to admin channel
-        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
-        if notification_channel:
-            await notification_channel.send(
-                f"🎟️ {member.mention} has checked in for the tournament!"
-            )
+    # Batch update check-in status
+    updates = []
+    for i, record in enumerate(existing_records, start=2):
+        if record.get("Discord ID") == friendly_discord_id:
+            updates.append((i, 20, "Yes"))  # Column 20 for "Checked In"
+            updates.append((i, 21, "No"))  # Column 21 for "Sitout Volunteer"
+            break
 
-    except Exception as e:
-        print(f"Error during check-in: {e}")
-        await interaction.response.send_message(
-            "❌ An error occurred during check-in. Please try again.",
-            ephemeral=True
-        )
+    if updates:
+        await batch_sheet_update(playerDB, updates)
 
-
-# Command to start check for volunteers to sit out of a match.
-@tree.command(
-    name='sitout',
-    description='Initiate check for volunteers to sit out from a match',
-    guild=discord.Object(GUILD))
-async def sitout(interaction: discord.Interaction):
-    player = interaction.user
-
-    # Upon volunteering to sit out for a round, update the player's Discord username in the database if it has been
-    # changed. This may be redundant if users are eventually restricted from volunteering before they've checked in.
-    # await update_username(player)
-
-    view = volunteerButtons()
     await interaction.response.send_message(
-        'The Volunteer check has started! You have 15 minutes to volunteer if you wish to sit out.', view=view)
+        "✅ You've successfully checked in for the tournament!",
+        ephemeral=True
+    )
 
+    notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+    if notification_channel:
+        await notification_channel.send(
+            f"🎟️ {member.mention} has checked in for the tournament!"
+        )
 
 @tree.command(
     name='create_game',
     description='Create a lobby of 10 players after enough have checked in',
     guild=discord.Object(GUILD))
+
+@commands.has_permissions(administrator=True)
 async def create_game(interaction: discord.Interaction):
     def format_team(team, team_name):
         return (
@@ -3097,127 +3006,168 @@ async def create_game(interaction: discord.Interaction):
         await interaction.response.defer()
 
         # Get and validate players
-
         playerDataImport = playerDB.get_all_records()
         checked_in_players = [p for p in playerDataImport if p.get("Checked In", "").lower() == "yes"]
+        sitout_players = [p for p in playerDataImport if p.get("Sitout Volunteer", "").lower() == "yes"]
 
-        if len(checked_in_players) < 10:
+        if sitout_players:
+
+            pass
+
+        else:
+
+            sitout_players = []
+
+        if len(checked_in_players) + len(sitout_players) < 10:
             await interaction.followup.send(
-                f"❌ Not enough players checked in ({len(checked_in_players)}/10). Cannot create game.",
+                f"❌ Not enough players checked in ({len(checked_in_players) + len(sitout_players)}/10). Cannot create game.",
                 ephemeral=True
             )
             return
 
         else:  # Create 1 or more lobbies
 
-            totalNeededLobbies = len(checked_in_players) // 10  # Integer division, divides into fully fillable lobbies
+            # Case 1 - < 10 chk, > 1 sp, > 10 players
+            # Case 2 - > 10 chk, 
+            # Case 3 - > 10 chk, > 1 sp, > 20 players
+
+            totalNeededLobbies = (len(checked_in_players) + len(sitout_players)) // 10  # Integer division, divides into fully fillable lobbies
             # Prepare player data
-            players = []
+            checkedInPlayerList = []
+            sitoutPlayerList = []
             for player in checked_in_players:
-                players.append(player.get("Players1", "UNKNOWN"))
-                players.append(player.get("Rank Tier", "1"))
-                players.append(player.get("Role 1 (Top)"))
-                players.append(player.get("Role 2 (Jungle)"))
-                players.append(player.get("Role 3 (Mid)"))
-                players.append(player.get("Role 4 (ADC)"))
-                players.append(player.get("Role 5 (Support)"))
+                checkedInPlayerList.append(player.get("Players1", "UNKNOWN"))
+                checkedInPlayerList.append(player.get("Rank Tier", "1"))
+                checkedInPlayerList.append(player.get("Role 1 (Top)"))
+                checkedInPlayerList.append(player.get("Role 2 (Jungle)"))
+                checkedInPlayerList.append(player.get("Role 3 (Mid)"))
+                checkedInPlayerList.append(player.get("Role 4 (ADC)"))
+                checkedInPlayerList.append(player.get("Role 5 (Support)"))
 
-            intermediateList = formatList(players)  # Now we have a list of participant objects.
+            for player in sitout_players:
+                sitoutPlayerList.append(player.get("Players1", "UNKNOWN"))
+                sitoutPlayerList.append(player.get("Rank Tier", "1"))
+                sitoutPlayerList.append(player.get("Role 1 (Top)"))
+                sitoutPlayerList.append(player.get("Role 2 (Jungle)"))
+                sitoutPlayerList.append(player.get("Role 3 (Mid)"))
+                sitoutPlayerList.append(player.get("Role 4 (ADC)"))
+                sitoutPlayerList.append(player.get("Role 5 (Support)"))
+
+
+
+            intermediateList = formatList(checkedInPlayerList)  # Now we have a list of participant objects.
+            sitoutList = formatList(sitoutPlayerList)
             random.shuffle(intermediateList)
+            random.shuffle(sitoutList)
+            canRun = True
+            targetNumPlayers = 10 * totalNeededLobbies
 
-            # If we only need 1 lobby, we can just leave it randomized for more variety.
-            if totalNeededLobbies == 1:
+            if len(intermediateList) >= targetNumPlayers: # Case 1 - too many players even without sitout players. Don't need to add sitout players, matchmake as normal.
 
-                finalList = [intermediateList]
+                pass
 
-            else:  # If we need more than one lobby, we should sort players, so that higher tier players play against each other
+            elif len(intermediateList) < targetNumPlayers: # Case 2 - need sitout players to finish lobby.
 
-                sortedPlayers = (sorted(intermediateList, key=lambda x: x.tier))
+                neededNum = targetNumPlayers - len(intermediateList)
+                for x in range(0,neededNum):
 
-                finalList = []
-                num_players = len(sortedPlayers)
+                    intermediateList.append(sitoutList[x])
+         
+            for player in intermediateList:
 
-                base_size = num_players // totalNeededLobbies
+                if player.tier not in [1,2,3,4,5,6,7]:
 
-                remainder = num_players % totalNeededLobbies
+                    canRun = False
 
-                start_index = 0
+            if canRun == True:
 
-                for i in range(totalNeededLobbies):
+                # If we only need 1 lobby, we can just leave it randomized for more variety.
+                if totalNeededLobbies == 1:
+                    finalList = [intermediateList]
+                else:  # If we need more than one lobby, we should sort players, so that higher tier players play against each other
+                    sortedPlayers = sorted(intermediateList, key=lambda x: x.tier)
+                    finalList = []
+                    num_players = len(sortedPlayers)
+                    base_size = num_players // totalNeededLobbies
+                    remainder = num_players % totalNeededLobbies
+                    start_index = 0
+                    for i in range(totalNeededLobbies):
+                        if i < remainder:
+                            end_index = start_index + base_size + 1
+                        else:
+                            end_index = start_index + base_size
+                        lobby = sortedPlayers[start_index:end_index]
+                        finalList.append(lobby)
+                        start_index = end_index
 
-                    # Each lobby will have at least `base_size` players
-                    # If there are extra players (from the remainder),
-                    # give one more player to the first 'remainder' lobbies
+                # Run matchmaking
+                for x in range(0, totalNeededLobbies):
+                    matchmakingList = finalList[x]
+                    bothTeams = await matchmake(interaction, matchmakingList)
 
-                    if i < remainder:
-                        end_index = start_index + base_size + 1
-                    else:
-                        end_index = start_index + base_size
+                    global current_teams
+                    current_teams = {"team1": bothTeams[0], "team2": bothTeams[1]}
+                    try:
+                        save_teams_to_sheet(bothTeams)
+                        print("Team successfully saved to database.")
+                    except Exception as e:
+                        print(f"Error saving team: {e}")
 
-                    lobby = sortedPlayers[start_index:end_index]
-                    finalList.append(lobby)
+                    # Confirm success
+                    await interaction.followup.send("✅ Game created and saved to database successfully!")
 
-                    # Step 4.3: Update the starting index of the list for the next lobby
-                    start_index = end_index
-
-            # Run matchmaking
-            for x in range(0, totalNeededLobbies):
-
-                matchmakingList = finalList[x]
-                bothTeams = await matchmake(interaction, matchmakingList)
-
-                global current_teams
-                current_teams = {"team1": bothTeams[0], "team2": bothTeams[1]}
+                # Increment participation and games played for all players in the game
                 try:
-                    save_teams_to_sheet(bothTeams)
-                    print("Team successfully saved to database.")
+                    all_players = []
+                    for team in [bothTeams[0], bothTeams[1]]:
+                        all_players.extend([
+                            team.topLaner.name, team.jgLaner.name, team.midLaner.name,
+                            team.adcLaner.name, team.supLaner.name
+                        ])
+
+                    existing_records = playerDB.get_all_records()
+                    updates = []
+                    for player_name in all_players:
+                        for i, record in enumerate(existing_records, start=2):
+                            if record.get("Players1") == player_name:
+                                current_tier_part = int(record.get("Participation (Current Tier)", 0))
+                                total_part = int(record.get("Participation (Total)", 0))
+                                current_games = int(record.get("Games Played (Current Tier)", 0))  # Fixed key case
+                                total_games = int(record.get("Games Played (Total)", 0))
+
+                                updates.append({
+                                    'range': f'I{i}:P{i}',  # Extended range to include O and P
+                                    'values': [[
+                                        current_tier_part + 1,  # I: Participation (Current Tier)
+                                        total_part + 1,         # J: Participation (Total)
+                                        0,                      # K: Wins (Current Tier) - not updated here
+                                        0,                      # L: Wins (Total) - not updated here
+                                        0,                      # M: MVPs - not updated here
+                                        0,                      # N: Toxicity - not updated here
+                                        current_games + 1,      # O: Games Played (Current Tier)
+                                        total_games + 1         # P: Games Played (Total)
+                                    ]]
+                                })
+                                break
+
+                    if updates:
+                        async with sheets_limiter:
+                            playerDB.batch_update(updates)
+                        print("Updated participation and games played for all players in the game.")
                 except Exception as e:
-                    print(f"Error saving team: {e}")
+                    print(f"Error updating participation and games played: {e}")
+                    await interaction.followup.send(
+                        "⚠️ Game created, but failed to update player stats. Check logs.",
+                        ephemeral=True
+                    )
 
-                # Confirm success
-                await interaction.followup.send("✅ Game created and saved to database successfully!")
+            else:
 
-                # Increment participation for all players in the game
-            # Increment participation for all players in the game
-            try:
-                all_players = []
-                for team in [bothTeams[0], bothTeams[1]]:
-                    all_players.extend([
-                        team.topLaner.name, team.jgLaner.name, team.midLaner.name,
-                        team.adcLaner.name, team.supLaner.name
-                    ])
-
-                existing_records = playerDB.get_all_records()
-                updates = []
-                for player_name in all_players:
-                    for i, record in enumerate(existing_records, start=2):
-                        if record.get("Players1") == player_name:
-                            current_tier_part = int(record.get("Participation (Current Tier)", 0))
-                            total_part = int(record.get("Participation (Total)", 0))
-                            current_games = int(record.get("Games Played (current tier)", 0))
-                            total_games = int(record.get("Games Played (Total)", 0))
-                            wins_current = int(record.get("Wins (Current Tier)", 0))
-                            wins_total = int(record.get("Wins (Total)", 0))
-
-                            updates.append({
-                                'range': f'I{i}:P{i}',
-                                'values': [[
-                                    current_tier_part + 1, total_part + 1,
-                                    float(wins_current / max(1, current_games + 1)),  # WR % Current
-                                    wins_current, total_games + 1,
-                                    float(wins_total / max(1, total_games + 1)),  # WR % Total
-                                    current_games + 1, total_games + 1
-                                ]]
-                            })
-                            break
-
-                if updates:
-                    async with sheets_limiter:
-                        playerDB.batch_update(updates)
-                    print("Updated participation and games played for all players in the game.")
-            except Exception as e:
-                print(f"Error updating participation: {e}")
-
+                admin_mention = get_admin_mention(interaction.guild)
+                notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+                await notification_channel.send(
+                    f"{admin_mention} - Cannot run matchmaking. A participant does not have a valid tier!"
+                        )
 
     except Exception as e:
         print(f"Error in create_game: {e}")
@@ -3225,6 +3175,7 @@ async def create_game(interaction: discord.Interaction):
             "An error occurred while creating the game. Check console for details.",
             ephemeral=True
         )
+
 @tree.command(
     name="swap",
     description="Swap two players between teams (Admin only).",
@@ -3423,7 +3374,6 @@ async def swap(interaction: discord.Interaction, player1: str, player2: str):
                 f"❌ Error swapping players: {e}",
                 ephemeral=True
             )
-
 @tree.command(
     name="toxicity",
     description="Add a toxicity point to a player (Admin only).",
@@ -3432,42 +3382,35 @@ async def swap(interaction: discord.Interaction, player1: str, player2: str):
 @commands.has_permissions(administrator=True)
 async def toxicity(interaction: discord.Interaction, player_name: str):
     try:
-        # Fetch existing records from the Google Sheet
         existing_records = playerDB.get_all_records()
-
-        # Find the player in the database by name
-        player_found = None
-        row_index = None
-        for i, record in enumerate(existing_records, start=2):  # Start from row 2 (row 1 is headers)
-            if record["Players1"] == player_name:  # Assuming "Players1" is the column for player names
-                player_found = record
-                row_index = i
-                break
-
-        if not player_found:
-            await interaction.response.send_message(f"❌ Player '{player_name}' not found in the database.",
-                                                    ephemeral=True)
-            return
-
-        # Increment the toxicity points
-        current_toxicity = int(player_found.get("Toxicity", 0))  # Assuming "Toxicity" is the column for toxicity points
-        new_toxicity = current_toxicity + 1
-
-        # Update the toxicity points in the Google Sheet
-        playerDB.update_cell(row_index, 16, new_toxicity)  # Assuming column 16 is for toxicity points
-
+        for i, record in enumerate(existing_records, start=2):
+            if record["Players1"] == player_name:
+                current_toxicity = int(record.get("Toxicity", 0))
+                new_toxicity = current_toxicity + 1
+                # Use rate limiter and update correct column (14 for Toxicity)
+                async with sheets_limiter:
+                    playerDB.update_cell(i, 14, new_toxicity)  # Column N (14) is Toxicity
+                await interaction.response.send_message(
+                    f"✅ Added 1 toxicity point to {player_name}. Total: {new_toxicity}",
+                    ephemeral=True
+                )
+                # Log to notification channel
+                notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+                if notification_channel:
+                    await notification_channel.send(
+                        f"⚠️ {player_name} received 1 toxicity point (Total: {new_toxicity}) by {interaction.user.mention}"
+                    )
+                return
         await interaction.response.send_message(
-            f"✅ Added 1 toxicity point to {player_name}. Their total toxicity points are now {new_toxicity}.",
+            f"❌ Player '{player_name}' not found.",
             ephemeral=True
         )
-
     except Exception as e:
-        print(f"An error occurred: {e}")
+        print(f"Error adding toxicity point: {e}")
         await interaction.response.send_message(
-            "An unexpected error occurred while adding toxicity points.",
+            f"❌ Failed to add toxicity point for {player_name}. Error: {str(e)}",
             ephemeral=True
         )
-
 
 @tree.command(
     name="remove_toxicity",
@@ -3499,7 +3442,7 @@ async def remove_toxicity(interaction: discord.Interaction, player_name: str):
         new_toxicity = max(0, current_toxicity - 1)  # Ensure toxicity points don't go below 0
 
         # Update the toxicity points in the Google Sheet
-        playerDB.update_cell(row_index, 16, new_toxicity)  # Assuming column 16 is for toxicity points
+        playerDB.update_cell(row_index, 14, new_toxicity)  # Assuming column 16 is for toxicity points
 
         await interaction.response.send_message(
             f"✅ Removed 1 toxicity point from {player_name}. Their total toxicity points are now {new_toxicity}.",
@@ -3551,7 +3494,6 @@ async def view_toxicity(interaction: discord.Interaction, player_name: str):
             ephemeral=True
         )
 
-
 @tree.command(
     name="uncheckin",
     description="Remove yourself from the tournament",
@@ -3560,34 +3502,77 @@ async def view_toxicity(interaction: discord.Interaction, player_name: str):
 async def uncheckin(interaction: discord.Interaction):
     member = interaction.user
     player_role = discord.utils.get(interaction.guild.roles, name='Player')
-
-    if player_role not in member.roles:
-        await interaction.response.send_message(
-            "❌ You're not currently checked in!",
-            ephemeral=True
-        )
-        return
-
+    friendly_discord_id = await get_friendly_discord_id(member.id, interaction.guild)
     try:
-        # Remove Player role
-        await member.remove_roles(player_role)
+        existing_records = playerDB.get_all_records()
+        updates = []
+        for i, record in enumerate(existing_records, start=2):
+            if record.get("Discord ID") == friendly_discord_id:
+                updates.append((i, 20, "No"))  # Column 20 for "Checked In"
+                updates.append((i, 21, "No"))  # Column 21 for "Sitout Volunteer"
+                break
 
-        await interaction.response.send_message(
-            "✅ You've been removed from the tournament. Use `/checkin` to rejoin.",
-            ephemeral=True
-        )
+        # Batch update spreadsheet
+        if updates:
+            await batch_sheet_update(playerDB, updates)
 
         # Send notification to admin channel
         notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
         if notification_channel:
             await notification_channel.send(
-                f"❌ {member.mention} has un-checked from the tournament."
+                f"❌ {member.mention} has un-checked in from the tournament."
             )
+
+        await interaction.response.send_message(
+            "✅ You've successfully un-checked in for the tournament!",
+            ephemeral=True
+        )
 
     except Exception as e:
         print(f"Error in uncheckin command: {e}")
         await interaction.response.send_message(
             "❌ Failed to uncheckin. Please try again or contact an admin.",
+            ephemeral=True
+        )
+
+@tree.command(
+    name="sitout",
+    description="Volunteer to sit out of the current game in case there are too many players.",
+    guild=discord.Object(GUILD)
+)
+async def sitout(interaction: discord.Interaction):
+    member = interaction.user
+    player_role = discord.utils.get(interaction.guild.roles, name='Player')
+    friendly_discord_id = await get_friendly_discord_id(member.id, interaction.guild)
+    try:
+        existing_records = playerDB.get_all_records()
+        updates = []
+        for i, record in enumerate(existing_records, start=2):
+            if record.get("Discord ID") == friendly_discord_id:
+                updates.append((i, 20, "No"))  # Column 20 for "Checked In"
+                updates.append((i, 21, "Yes"))  # Column 21 for "Sitout Volunteer"
+                break
+
+        # Batch update spreadsheet
+        if updates:
+            await batch_sheet_update(playerDB, updates)
+
+        # Send notification to admin channel
+        notification_channel = client.get_channel(int(NOTIFICATION_CHANNEL_ID))
+        if notification_channel:
+            await notification_channel.send(
+                f"❌ {member.mention} has volunteered to sit out."
+            )
+
+        await interaction.response.send_message(
+            "✅ You've successfully volunteered to sit out for the tournament!",
+            ephemeral=True
+        )
+
+    except Exception as e:
+        print(f"Error in sitout command: {e}")
+        await interaction.response.send_message(
+            "❌ Failed to sitout. Please try again or contact an admin.",
             ephemeral=True
         )
 
@@ -3627,121 +3612,28 @@ async def show_teams(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=False)
 
+@tree.command(
+    name="players",
+    description="Show current checked in and volunteering to sit out players",
+    guild=discord.Object(GUILD)
+)
+async def players(interaction: discord.Interaction):
 
-async def help_command(interaction: discord.Interaction):
-    pages = [
-        discord.Embed(
-            title="Help Menu 📚",
-            color=0xffc629
-        ).add_field(
-            name="/help",
-            value="Displays documentation on all bot commands.",
-            inline=False
-        ).add_field(
-            name="/link [riot_id]",
-            value="Link your Riot ID to your Discord account. Users are required to type this command before any others except /help.",
-            inline=False
-        ).add_field(
-            name="/rolepreference",
-            value="Set your role preferences for matchmaking.",
-            inline=False
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            color=0xffc629
-        ).add_field(
-            name="/checkin",
-            value="Initiate tournament check-in.",
-            inline=False
-        ).add_field(
-            name="/sitout",
-            value="Volunteer to sit out of the current match..",
-            inline=False
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/win [match_number] [lobby_number] [team]** - Add a win for the specified players.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/toxicity [discord_username]** - Give a user a point of toxicity.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/clear** - Remove all users from Player and Volunteer roles.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/players** - Find all players and volunteers currently enrolled in the game.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/points** - Update participation points in the spreadsheet.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/matchmake [match_number]** - Form teams for all players enrolled in the game.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="Help Menu 📚",
-            description="**/votemvp [username]** - Vote for the MVP of your match.",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="/uncheckin",
-            description="Remove yourself from the tournament",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="/volunteer",
-            description="Volunteer to sit out of the next match",
-            color=0xffc629
-        ),
-        discord.Embed(
-            title="/rejoin",
-            description="Rejoin the tournament after volunteering to sit out",
-            color=0xffc629
-        )
-    ]
-
-    # Set the footer for each page
-    for i, page in enumerate(pages, start=1):
-        page.set_footer(text=f"Page {i} of {len(pages)}")
-
-    current_page = 0
-
-    class HelpView(discord.ui.View):
-        def __init__(self, *, timeout=180):
-            super().__init__(timeout=timeout)
-            self.message = None
-
-        async def update_message(self, interaction: discord.Interaction):
-            await interaction.response.defer()  # Defer response to prevent timeout error
-            if self.message:
-                await self.message.edit(embed=pages[current_page], view=self)
-
-        @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
-        async def previous_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-            nonlocal current_page
-            current_page = (current_page - 1) % len(pages)  # Loop back to last page if on the first page
-            await self.update_message(interaction)
-
-        @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
-        async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-            nonlocal current_page
-            current_page = (current_page + 1) % len(pages)  # Loop back to first page if on the last page
-            await self.update_message(interaction)
-
-    view = HelpView()
-    await interaction.response.send_message(embed=pages[current_page], view=view, ephemeral=True)
-    view.message = await interaction.original_response()
-
+    existing_records = playerDB.get_all_records()
+    checked_in_players = [p for p in existing_records if p.get("Checked In", "").lower() == "yes"]
+    sitout_players = [p for p in existing_records if p.get("Sitout Volunteer", "").lower() == "yes"]
+    embed = discord.Embed(title="Participating Players", color=0x00ff00)
+    embed.add_field(
+        name="Checked in Players",
+        value=(checked_in_players),
+        inline=False
+    )
+    embed.add_field(
+        name="Sitout Volunteers",
+        value=(sitout_players),
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 # Shutdown of aiohttp session
 async def close_session():
@@ -3749,7 +3641,6 @@ async def close_session():
     if session is not None:
         await session.close()
         print("HTTP session has been closed.")
-
 
 @client.event
 async def on_disconnect():
