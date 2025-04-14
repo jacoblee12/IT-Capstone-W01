@@ -3621,16 +3621,29 @@ async def players(interaction: discord.Interaction):
 
     existing_records = playerDB.get_all_records()
     checked_in_players = [p for p in existing_records if p.get("Checked In", "").lower() == "yes"]
-    sitout_players = [p for p in existing_records if p.get("Sitout Volunteer", "").lower() == "yes"]
+    sitout_players = [p for p in existing_records if p.get("Sitout Volunteer", "").lower() == "yes"] 
+
+    finalDisplayCheckedIn = []
+    finalDisplaySitout = []
+    for record in checked_in_players:
+
+        appender = record.get("Players1")
+        finalDisplayCheckedIn.append(appender)
+
+    for record in sitout_players:
+
+        appender = record.get("Players1")
+        finalDisplaySitout.append(appender)
+
     embed = discord.Embed(title="Participating Players", color=0x00ff00)
     embed.add_field(
         name="Checked in Players",
-        value=(checked_in_players),
+        value=(finalDisplayCheckedIn),
         inline=False
     )
     embed.add_field(
         name="Sitout Volunteers",
-        value=(sitout_players),
+        value=(finalDisplaySitout),
         inline=False
     )
     await interaction.response.send_message(embed=embed, ephemeral=False)
